@@ -7,12 +7,16 @@ import numpy as np
 from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from skimage.measure import label as measure_label
 from skimage.morphology import skeletonize
 from skimage.segmentation import watershed
 
 from .colorspace import delta_e
 from .params import Params
 from .regions import adjacent_pairs, region_areas, region_medians, relabel_sequential
+
+# Off-color slivers are 1-2 px wide; each pass peels one pixel layer.
+OFFCOLOR_PASSES = 3
 
 
 def segment(lab: np.ndarray, opaque: np.ndarray, p: Params) -> np.ndarray:
@@ -39,7 +43,81 @@ def segment(lab: np.ndarray, opaque: np.ndarray, p: Params) -> np.ndarray:
     labels = _merge_similar(lab, labels, p.merge_de)
     labels = _merge_small(lab, labels, p)
     labels[~opaque] = 0
+    labels = _reassign_offcolor(lab, labels, p)
+    labels = _absorb_fragments(labels, p)
     return relabel_sequential(labels)
+
+
+def _reassign_offcolor(lab: np.ndarray, labels: np.ndarray, p: Params) -> np.ndarray:
+    """Move pixels whose color matches a 4-neighbor's region and clearly not their own.
+
+    The watershed follows gradient topology, not color: next to a line seed it can hand a sliver
+    of off-color pixels (e.g. a dark halo at a notch in an outline) to the line's region, which
+    then renders as a thin spike. A pixel moves when it is `offcolor_de` closer to the neighbor's
+    color and within `offcolor_match_de` of it. The second test keeps anti-aliased pixels in place:
+    they blend two colors and can lie closer to a third region's color without matching it.
+    Label 0 (transparent) is never a target.
+    """
+    medians = region_medians(lab, labels)
+    labels = labels.copy()
+    h, w = labels.shape
+    for _ in range(OFFCOLOR_PASSES):
+        padded = np.pad(labels, 1)
+        neighbors = [padded[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w] for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1))]
+        rows, cols = np.nonzero((labels > 0) & np.logical_or.reduce([nb != labels for nb in neighbors]))
+        own_label = labels[rows, cols]
+        colors = lab[rows, cols]
+        own = delta_e(colors, medians[own_label])
+        best = np.full(len(rows), np.inf)
+        target = own_label.copy()
+        for nb in neighbors:
+            cand = nb[rows, cols]
+            d = np.where((cand != own_label) & (cand > 0), delta_e(colors, medians[cand]), np.inf)
+            closer = d < best
+            best[closer] = d[closer]
+            target[closer] = cand[closer]
+        move = (own - best > p.offcolor_de) & (best < p.offcolor_match_de)
+        if not move.any():
+            break
+        labels[rows[move], cols[move]] = target[move]
+    return labels
+
+
+def _absorb_fragments(labels: np.ndarray, p: Params) -> np.ndarray:
+    """Give each detached piece of a region smaller than `small_area` to the neighboring region it
+    shares the longest border with; a region keeps its largest 4-connected piece. Such pieces are
+    left behind by pixel moves and would render as specks."""
+    comp = measure_label(labels, connectivity=1, background=0)
+    sizes = np.bincount(comp.ravel())
+    owner = np.zeros(len(sizes), dtype=labels.dtype)
+    owner[comp.ravel()] = labels.ravel()
+    ids = np.arange(1, len(sizes))
+    order = ids[np.lexsort((-sizes[ids], owner[ids]))]
+    is_main = np.zeros(len(sizes), dtype=bool)
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = owner[order[1:]] != owner[order[:-1]]
+    is_main[order[first]] = True
+    stray = ~is_main & (sizes < p.area(p.small_area))
+    stray[0] = False
+    if not stray.any():
+        return labels
+
+    pairs = []
+    for a, b, ca in ((labels[:, :-1], labels[:, 1:], comp[:, :-1]), (labels[:, 1:], labels[:, :-1], comp[:, 1:]),
+                     (labels[:-1], labels[1:], comp[:-1]), (labels[1:], labels[:-1], comp[1:])):
+        m = stray[ca] & (b != a) & (b > 0)
+        pairs.append(np.stack([ca[m], b[m]], axis=1))
+    pairs = np.concatenate(pairs)
+    if not len(pairs):
+        return labels
+    uniq, counts = np.unique(pairs, axis=0, return_counts=True)
+    # Per stray piece keep the neighbor with the most shared border pixels.
+    best = uniq[np.lexsort((-counts, uniq[:, 0]))]
+    keep = np.ones(len(best), dtype=bool)
+    keep[1:] = best[1:, 0] != best[:-1, 0]
+    lut = owner.copy()
+    lut[best[keep, 0]] = best[keep, 1]
+    return lut[comp]
 
 
 def is_elongated(area: float, skeleton_length: float, p: Params) -> bool:

@@ -25,6 +25,8 @@ class Params:
     tophat_min_area: float = 40.0
     merge_de: float = 2.5
     small_area: float = 50.0
+    offcolor_de: float = 10.0
+    offcolor_match_de: float = 15.0
 
     # 3. strokes
     stroke_max_width: float = 12.0
