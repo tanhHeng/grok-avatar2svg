@@ -22,8 +22,10 @@ TAPER_RATIO = 0.75
 MIN_WIDTH = 0.5
 # A free end whose width near the end stays above this fraction of the chain's median is cut, not drawn tapered.
 CUT_WIDTH_RATIO = 0.6
-# Cuts this close to parallel with the stroke fall back to a perpendicular cut.
-MIN_CUT_SIN = 0.3
+# A free end counts as cut only when the occluder's outline crosses the stroke at least this steeply
+# (sine of the angle). Shallower contact means the line runs along that outline; a flat cut there
+# would stretch the end into a spike about half-width * cot(angle) long.
+CUT_MIN_SIN = 0.7
 # Pixels of contact a third region needs around a free end to count as the occluder.
 TIP_CONTACT_MIN = 3
 
@@ -135,7 +137,7 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
     strokes: list[Stroke] = []
     for pi, prep in enumerate(preps):
         own = {(ci, side): c for (q, ci, side), c in cuts.items() if q == pi}
-        stroke = _finish(prep, own, labels, p)
+        stroke = _finish(prep, own, p)
         if stroke is not None:
             strokes.append(stroke)
             mask_all[stroke.pixels[:, 0], stroke.pixels[:, 1]] = True
@@ -187,6 +189,7 @@ class _Cut:
     out: np.ndarray  # unit direction out of the stroke, into the occluder
     front: int  # occluder label
     width: float  # width kept up to the cut
+    along: np.ndarray  # unit direction of the occluder's outline at the exit: the cut line
     curve: JointCurve | None = None  # set when paired across the occluder
 
 
@@ -249,7 +252,10 @@ def _classify_end(prep: _Prepared, ch: _Chain, side: int, labels: np.ndarray, p:
         front, exit_pt = contact
         if np.linalg.norm(exit_pt - pts[0]) > 1e-6:
             out = unit(exit_pt - pts[0])
-    return _Cut(exit_pt, out, front, w_cut)
+    along = _occluder_direction(labels, exit_pt, front, max(w, p.px(3.0)), np.array([out[1], -out[0]]))
+    if abs(float(np.array([along[1], -along[0]]) @ out)) < CUT_MIN_SIN:
+        return None
+    return _Cut(exit_pt, out, front, w_cut, along)
 
 
 def _tip_contact(labels: np.ndarray, prep: _Prepared, end: np.ndarray, radius: float, sides: set) -> tuple[int, np.ndarray] | None:
@@ -290,17 +296,15 @@ def _occluder_direction(labels: np.ndarray, at: np.ndarray, front: int, radius: 
     return unit(vt[0])
 
 
-def _apply_cut(poly, widths, side, cut: _Cut, prep: _Prepared, labels: np.ndarray, p: Params):
+def _apply_cut(poly, widths, side, cut: _Cut, prep: _Prepared, p: Params):
     """Run the centerline to the occluder at full width. Returns (poly, widths, cut direction,
     end tangent pointing into the chain or None)."""
     pts = poly if side == 0 else poly[::-1]
     ws = widths if side == 0 else widths[::-1]
     w = prep.width
-    normal = np.array([cut.out[1], -cut.out[0]])
-    f = _occluder_direction(labels, cut.exit, cut.front, max(w, p.px(3.0)), normal)
     exit_pt, tangent = cut.exit, None
     if cut.curve is not None:
-        exit_pt = slide_onto(cut.curve, exit_pt, f, p.px(p.occlusion_max_slide))
+        exit_pt = slide_onto(cut.curve, exit_pt, cut.along, p.px(p.occlusion_max_slide))
         t = cut.curve.tangent(exit_pt)
         tangent = t if float(t @ cut.out) <= 0 else -t
     gap = float(np.linalg.norm(pts[0] - exit_pt))
@@ -315,10 +319,10 @@ def _apply_cut(poly, widths, side, cut: _Cut, prep: _Prepared, labels: np.ndarra
         snap_toward(pts, 0, 1, False, cut.curve, p.px(p.tangent_r0 + p.tangent_len))
     if side == 1:
         pts, ws = pts[::-1], ws[::-1]
-    return pts, ws, f, tangent
+    return pts, ws, cut.along, tangent
 
 
-def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], labels: np.ndarray, p: Params) -> Stroke | None:
+def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], p: Params) -> Stroke | None:
     eps = p.px(p.eps_stroke)
     outline: list[Curve] = []
     centerline: list[Curve] = []
@@ -332,7 +336,7 @@ def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], labels: np.ndarr
             kinds = ["taper" if tapered[s] else "round" for s in (0, 1)]
             for s in (0, 1):
                 if (ci, s) in cuts:
-                    poly, widths, kinds[s], tangents[s] = _apply_cut(poly, widths, s, cuts[(ci, s)], prep, labels, p)
+                    poly, widths, kinds[s], tangents[s] = _apply_cut(poly, widths, s, cuts[(ci, s)], prep, p)
         center = fit_path(poly, eps, closed=ch.closed, t0=tangents[0], t1=tangents[1])
         centerline.append(center)
         for loop in _outline_loops(center, poly, widths, ch.closed, kinds):
@@ -686,7 +690,7 @@ def _outline_loops(center: Curve, poly: np.ndarray, widths: np.ndarray, closed: 
 def _cut_poly(poly: np.ndarray, x: np.ndarray, t_out: np.ndarray, f: np.ndarray) -> np.ndarray:
     """Trim an offset polyline at the cut line through `x` along `f` and end it exactly on the line."""
     m = np.array([f[1], -f[0]])
-    if abs(float(m @ t_out)) < MIN_CUT_SIN:
+    if abs(float(m @ t_out)) < CUT_MIN_SIN:
         m = t_out.copy()
     elif float(m @ t_out) < 0:
         m = -m
