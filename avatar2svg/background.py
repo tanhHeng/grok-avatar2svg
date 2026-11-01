@@ -13,22 +13,22 @@ from .regions import adjacent_pairs, region_medians, relabel_sequential
 _BORDER_CLUSTER_DE = 2.5
 
 
-def detect_background(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray | None]:
-    """Set background regions to 0 and relabel; also return the background color c_bg (None without opaque border).
+def find_background(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray | None]:
+    """Bool per label marking background regions, and the background color c_bg (None without opaque border).
 
     Background regions are found only through adjacency starting from regions on the image border, never by
     global color matching, so enclosed regions of background color (e.g. eyes) survive.
     """
+    n = int(labels.max()) + 1
     border = np.zeros(labels.shape, dtype=bool)
     border[[0, -1], :] = True
     border[:, [0, -1]] = True
     border &= labels > 0
     if not border.any():
-        return labels.copy(), None
+        return np.zeros(n, dtype=bool), None
     c_bg = _border_color(lab[border])
 
     medians = region_medians(lab, labels)
-    n = len(medians)
     near = delta_e(medians, c_bg) < p.bg_de
     near[0] = False
     on_border = np.zeros(n, dtype=bool)
@@ -39,11 +39,14 @@ def detect_background(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[n
     graph = coo_matrix((np.ones(len(pairs), dtype=np.int8), (pairs[:, 0], pairs[:, 1])), shape=(n, n)).tocsr()
     _, comp = connected_components(graph, directed=False)
     seed_comps = np.unique(comp[near & on_border])
-    is_bg = near & np.isin(comp, seed_comps)
+    return near & np.isin(comp, seed_comps), c_bg
 
+
+def drop_background(labels: np.ndarray, background: np.ndarray) -> np.ndarray:
+    """Set background regions (bool per label, as from find_background) to 0 and relabel the rest 1..N."""
     out = labels.copy()
-    out[is_bg[labels]] = 0
-    return relabel_sequential(out), c_bg
+    out[background[labels]] = 0
+    return relabel_sequential(out)
 
 
 def _border_color(colors: np.ndarray) -> np.ndarray:

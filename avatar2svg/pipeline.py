@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .background import detect_background
+from .background import drop_background, find_background
 from .coloring import Fill, region_fills, unify_colors
 from .colorspace import rgb_to_lab
 from .fitting import fit_path
@@ -54,8 +54,9 @@ def vectorize(rgb: np.ndarray, opaque: np.ndarray, params: Params | None = None)
     lab = step("lab", rgb_to_lab, rgb)
     labels = step("segment", segment, lab, opaque, p)
     n_segments = int(labels.max())
+    background, c_bg = step("background", find_background, lab, labels, p)
     labels, strokes, stroke_mask = step("strokes", extract_strokes, lab, labels, p)
-    labels, c_bg = step("background", detect_background, lab, labels, p)
+    labels = drop_background(labels, background)
     pm = step("planar", build_planar_map, labels, p)
     medians = region_medians(lab, labels)
     step("subpixel", refine_edges, pm, lab, medians, stroke_mask, p)
