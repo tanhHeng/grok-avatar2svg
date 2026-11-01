@@ -31,6 +31,9 @@ TIP_CONTACT_MIN = 3
 # Cross-section sampling for ink coverage: step, and how far beyond the half width the side colors are read.
 INK_STEP = 0.25
 INK_SIDE_GAP = 2.5
+# How far (as a fraction of the side-line contrast) a sample may sit from the straight Lab segment
+# between side and line and still count as their blend; sRGB anti-aliasing bends off that segment.
+INK_BLEND_TOL = 0.5
 # Tip tracing: step along the ridge, how far the ridge may shift sideways per step, and how much of
 # each step's direction comes from the ridge (the rest is momentum, which rides over pixel noise).
 TRACE_STEP = 0.5
@@ -761,7 +764,8 @@ def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
     measured against its own side, so a line on the boundary of two regions works, and the two half
     widths place the line's centre. The ridge is searched within `search` (default: the half width
     + 1 px) of each point. Width, centre and peak are NaN where either side is within `min_contrast`
-    of the line color (crossings, line-colored neighbors).
+    of the line color (crossings, line-colored neighbors). Samples further than INK_BLEND_TOL of the
+    contrast from every blend of side and line carry no ink.
     """
     half = 0.5 * np.maximum(guide, 1.0)
     reach = half + INK_SIDE_GAP
@@ -777,7 +781,11 @@ def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
         v = color[None, :] - side
         vv = (v * v).sum(axis=1)
         ok &= vv >= min_contrast**2
-        fracs.append(((cs - side[:, None, :]) * v[:, None, :]).sum(axis=2) / np.maximum(vv, 1e-9)[:, None])
+        f = ((cs - side[:, None, :]) * v[:, None, :]).sum(axis=2) / np.maximum(vv, 1e-9)[:, None]
+        # A sample that is no blend of side and line (another, darker object within reach) is not ink.
+        closest = side[:, None, :] + np.clip(f, 0.0, 1.0)[..., None] * v[:, None, :]
+        tol = np.maximum(min_contrast, INK_BLEND_TOL * np.sqrt(vv))[:, None]
+        fracs.append(np.where(np.linalg.norm(cs - closest, axis=2) <= tol, f, 0.0))
     f_lo, f_hi = fracs
     limit = half + 1.0 if search is None else np.broadcast_to(np.asarray(search, dtype=np.float64), (n,))
     peak_f = np.where(np.abs(us)[None, :] <= limit[:, None], np.minimum(f_lo, f_hi), -np.inf)
