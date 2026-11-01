@@ -8,10 +8,12 @@ import numpy as np
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
+from .colorspace import blend_curve, delta_e
 from .fitting import bezier_eval, fit_path, smooth_piece
 from .geometry import arc_lengths, direction_from_end, pair_branches, resample, signed_area, unit
 from .occlusion import JointCurve, OccludedEnd, joint_curve, pair_occluded_ends, probe_front, slide_onto, snap_toward
 from .params import Params
+from .planar import PlanarMap
 from .segment import flat_mask, is_elongated
 
 Curve = list[np.ndarray]
@@ -39,12 +41,19 @@ INK_BLEND_TOL = 0.5
 TRACE_STEP = 0.5
 TRACE_SHIFT = 1.0
 TRACE_TURN = 0.3
+# Boundary lines: the line's core must be this far (px) from any third region, whose own
+# anti-aliasing would otherwise read as a line; and the line must stand out from the nearer side by
+# this fraction of the contrast between the sides. A rim much fainter than the edge it sits on is
+# within that edge's anti-aliasing (dark rims around the eyes: 6 delta E on an 85 delta E edge),
+# and drawing it shifts the steep edge as much as it adds.
+LINE_CLEARANCE = 2.0
+LINE_EDGE_RATIO = 0.2
 
 
 @dataclass
 class Stroke:
-    label: int  # region id in the input label map
-    pixels: np.ndarray  # (M, 2) int (row, col)
+    label: int  # region id in the input label map; -1 for boundary lines, which own no region
+    pixels: np.ndarray  # (M, 2) int (row, col); empty for boundary lines
     outline: list[Curve]  # closed subpaths for fill-rule nonzero: positive signed_area, ring holes negative
     centerline: list[Curve]  # fitted centerline per chain
     color: np.ndarray  # Lab fill; outline widths put down the image's ink only when drawn in this color
@@ -225,6 +234,137 @@ def _split_limbs(labels: np.ndarray, flat: np.ndarray, background: np.ndarray | 
     return out, parent
 
 
+def boundary_strokes(lab: np.ndarray, pm: PlanarMap, curves: list[Curve], labels: np.ndarray, medians: np.ndarray,
+                     stroke_mask: np.ndarray, p: Params) -> list[Stroke]:
+    """Lines that segmentation split between the two regions beside them (design 3, "boundary lines").
+
+    An outline with little contrast against one side, such as a hair clip's rim where it crosses a
+    strand of nearly its own color, gets no seed; the watershed hands its pixels to the regions on
+    either side and the fill boundary runs through the line, which vanishes. Along every edge between
+    two drawn regions, cross-sections within boundary_line_search of the fitted edge are compared
+    with the sRGB blends of the two side colors, which is all anti-aliasing between them produces;
+    a sample further than boundary_line_de from every blend is ink of a third color. Runs of such
+    samples at least boundary_line_min_len long, clear of third regions and existing strokes (see
+    LINE_CLEARANCE, LINE_EDGE_RATIO), become strokes measured from their ink like any other. Run
+    ends inside the edge taper; ends at its nodes are round, since the line usually carries on along
+    the next edge or into a region of its own color.
+    """
+    eps = p.px(p.eps_stroke)
+    search = p.px(p.boundary_line_search)
+    min_len = p.px(p.boundary_line_min_len)
+    sigma = p.px(p.smooth_stroke)
+    us = np.arange(-search, search + 1e-9, INK_STEP)
+    h, w = labels.shape
+    # A third color within reach of a stroke is that stroke's own anti-aliasing.
+    near_stroke = ndimage.binary_dilation(stroke_mask, iterations=int(np.ceil(search)))
+    r = int(np.ceil(p.px(LINE_CLEARANCE)))
+    dy, dx = (a.ravel() for a in np.mgrid[-r:r + 1, -r:r + 1])
+    # A run this close to a node reaches it: the clearance test drops the samples next to the node.
+    lead = r + 2
+    out: list[Stroke] = []
+    for eid in sorted({eid for cycles in pm.cycles.values() for cyc in cycles for eid, _ in cyc}):
+        e = pm.edges[eid]
+        if e.left <= 0 or e.right <= 0:
+            continue  # outline against the transparent background stays the region's edge
+        pts = resample(_sample_curve(curves[eid], e.closed), 1.0, closed=e.closed)
+        if len(pts) < min_len:
+            continue
+        normals = _normals(pts, e.closed)
+        xy = pts[:, None, :] + us[None, :, None] * normals[:, None, :]
+        # Pixel colors, not interpolated ones: interpolating Lab between the two sides of a hard edge
+        # runs along the straight Lab segment, which sits far from the sRGB blends for some pairs.
+        px_col = np.clip(np.floor(xy[..., 0]).astype(int), 0, w - 1)
+        px_row = np.clip(np.floor(xy[..., 1]).astype(int), 0, h - 1)
+        colors = lab[px_row, px_col].astype(np.float64)
+        blends = blend_curve(medians[e.left], medians[e.right])
+        off_blend = np.linalg.norm(colors[:, :, None, :] - blends, axis=-1).min(axis=-1)
+        j = off_blend.argmax(axis=1)
+        k = np.arange(len(pts))
+        col, row = px_col[k, j], px_row[k, j]
+        around = labels[np.clip(row[:, None] + dy, 0, h - 1), np.clip(col[:, None] + dx, 0, w - 1)]
+        ink = ((off_blend[k, j] >= p.boundary_line_de) & np.isin(around, (e.left, e.right)).all(axis=1)
+               & ~near_stroke[row, col])
+        edge_contrast = float(delta_e(medians[e.left], medians[e.right]))
+        for sel, loop in _runs(ink, e.closed, 2):
+            if len(sel) < min_len:
+                continue
+            good = sel[ink[sel]]
+            color = np.median(colors[good, j[good]], axis=0)
+            if min(delta_e(color, medians[e.left]), delta_e(color, medians[e.right])) < LINE_EDGE_RATIO * edge_contrast:
+                continue
+            if not e.closed:
+                if sel[0] <= lead:
+                    sel = np.concatenate([np.arange(sel[0]), sel])
+                if sel[-1] >= len(pts) - 1 - lead:
+                    sel = np.concatenate([sel, np.arange(sel[-1] + 1, len(pts))])
+            # Gap and extension samples take the line's offset from the edge from their ink neighbors.
+            pos = np.flatnonzero(ink[sel])
+            offset = np.interp(np.arange(len(sel)), pos, us[j[sel[pos]]], period=len(sel) if loop else None)
+            center = pts[sel] + offset[:, None] * normals[sel]
+            center = ndimage.gaussian_filter1d(center, sigma, axis=0, mode="wrap") if loop else smooth_piece(center, sigma)
+            center = resample(center, 1.0, closed=loop)
+            if len(center) < 3:
+                continue
+            n2 = _normals(center, loop)
+            sides = _edge_sides(lab, labels, center, n2, 2.0, e, medians)
+            first, _, _, _ = _ink(lab, center, n2, np.full(len(center), 2.0), color, p.ink_min_contrast, sides=sides)
+            if np.isnan(first).mean() > 0.5:
+                continue  # mostly within ink_min_contrast of a side: no line to measure
+            mean_w = max(float(np.nanmedian(first)), 1.0)
+            sides = _edge_sides(lab, labels, center, n2, mean_w, e, medians)
+            # Where ink is undefined the line has merged into a side; width 0 lets it fade there.
+            widths, offsets = _line_profile(center, n2, lab, color, np.full(len(center), mean_w), np.zeros(len(center)),
+                                            np.zeros(len(center), dtype=bool), mean_w, loop, p, sides)
+            center = center + offsets[:, None] * n2
+            kinds = ["round", "round"]
+            if not loop:
+                s = arc_lengths(center)
+                for side, inside in ((0, sel[0] != 0 or e.closed), (1, sel[-1] != len(pts) - 1 or e.closed)):
+                    if inside:
+                        dist = s if side == 0 else s[-1] - s
+                        widths = widths * np.clip(dist / mean_w, 0.0, 1.0)
+                        kinds[side] = "taper"
+            fitted = fit_path(center, eps, closed=loop)
+            outline = [fit_path(loop_pts, eps, closed=True) for loop_pts in _outline_loops(fitted, center, widths, loop, kinds)]
+            if outline:
+                out.append(Stroke(-1, np.empty((0, 2), dtype=np.int64), outline, [fitted], color))
+    return out
+
+
+def _edge_sides(lab, labels, center, normals, guide, e, medians) -> tuple[np.ndarray, np.ndarray]:
+    """Side colors for a boundary line, -normal side first (the normal points to the edge's left).
+
+    Read where _ink would read them, just beyond the line, so a region whose color drifts toward the
+    edge (a gradient) is compared with its color there; but where that spot falls in a third region,
+    such as the far side of a thin region, the edge region's median stands in.
+    """
+    h, w = labels.shape
+    d = 0.5 * max(guide, 1.0) + INK_SIDE_GAP + 0.5
+    out = []
+    for sgn, region in ((-1.0, e.right), (1.0, e.left)):
+        q = center + sgn * d * normals
+        col = np.clip(np.floor(q[:, 0]).astype(int), 0, w - 1)
+        row = np.clip(np.floor(q[:, 1]).astype(int), 0, h - 1)
+        out.append(np.where((labels[row, col] == region)[:, None], _sample_lab(lab, q), medians[region]))
+    return out[0], out[1]
+
+
+def _runs(mask: np.ndarray, closed: bool, max_gap: int) -> list[tuple[np.ndarray, bool]]:
+    """Index arrays of the runs of True in `mask`, bridging gaps of up to max_gap samples, with a
+    flag for a run that covers a closed sequence entirely. Runs of a closed sequence may wrap."""
+    idx = np.flatnonzero(mask)
+    if not len(idx):
+        return []
+    n = len(mask)
+    groups = np.split(idx, np.flatnonzero(np.diff(idx) > max_gap + 1) + 1)
+    if closed:
+        if len(groups) == 1 and n - (idx[-1] - idx[0] + 1) <= max_gap:
+            return [(np.arange(n), True)]
+        if len(groups) > 1 and idx[0] + n - idx[-1] <= max_gap + 1:
+            groups = [np.concatenate([groups[-1], groups[0] + n])] + groups[1:-1]
+    return [(np.arange(g[0], g[-1] + 1) % n, False) for g in groups]
+
+
 @dataclass
 class _Chain:
     poly: np.ndarray  # smoothed centerline, ~1 px spacing
@@ -292,7 +432,11 @@ def _prepare(label: int, lab: np.ndarray, labels: np.ndarray, box: tuple[slice, 
             continue
         poly = _smooth_chain(poly, closed, p.px(p.smooth_stroke))
         normals = _normals(poly, closed)
-        widths, offsets = _line_profile(poly, normals, lab, prep, junction_pos, closed, p)
+        near_junction = np.zeros(len(poly), dtype=bool)
+        for jp in junction_pos:
+            near_junction |= np.linalg.norm(poly - jp, axis=1) < 0.5 * float(prep.width_at(jp[None, :])[0]) + 1.0
+        edt = prep.width_at(poly)
+        widths, offsets = _line_profile(poly, normals, lab, color, edt, edt, near_junction, width, closed, p)
         poly = poly + offsets[:, None] * normals
         prep.chains.append(_Chain(poly, widths, closed, free))
     return prep if prep.chains else None
@@ -683,25 +827,22 @@ def _normals(poly: np.ndarray, closed: bool) -> np.ndarray:
     return np.stack([tang[:, 1], -tang[:, 0]], axis=1)
 
 
-def _line_profile(poly, normals, lab, prep: _Prepared, junction_pos, closed, p: Params) -> tuple[np.ndarray, np.ndarray]:
+def _line_profile(poly, normals, lab, color, guide, fallback, skip, mean_width, closed, p: Params,
+                  sides=None) -> tuple[np.ndarray, np.ndarray]:
     """Width and centre offset (along `normals`) per centerline sample, from ink coverage.
 
-    The skeleton runs mid-way through the stroke region, which can sit a few tenths of a pixel off
-    the line's ink; the offset moves the centerline onto it. Where ink is undefined the width falls
-    back to the distance transform and the offset is interpolated. Samples near junctions, where the
-    region is wider than any single line through it, are bridged from both sides, then both profiles
-    are smoothed over about one stroke width.
+    The centerline comes from the segmentation (a skeleton, a region boundary), which can sit a few
+    tenths of a pixel off the line's ink; the offset moves it onto the ink. `guide` is the expected
+    width, which sets how far _ink looks. Where ink is undefined the width falls back to `fallback`
+    and the offset is interpolated. `skip` samples (near junctions, where a region is wider than any
+    single line through it) are bridged from both sides, then both profiles are smoothed over about
+    one stroke width. `sides` as for _ink.
     """
-    edt = prep.width_at(poly)
-    ink, centre, _, _ = _ink(lab, poly, normals, edt, prep.color, p.ink_min_contrast)
-    near_junction = np.zeros(len(poly), dtype=bool)
-    for jp in junction_pos:
-        radius = 0.5 * float(prep.width_at(jp[None, :])[0]) + 1.0
-        near_junction |= np.linalg.norm(poly - jp, axis=1) < radius
-    widths = _bridge(np.where(np.isnan(ink), edt, np.maximum(ink, MIN_WIDTH)), near_junction, closed)
-    unknown = near_junction | np.isnan(centre)
+    ink, centre, _, _ = _ink(lab, poly, normals, guide, color, p.ink_min_contrast, sides=sides)
+    widths = _bridge(np.where(np.isnan(ink), fallback, np.maximum(ink, MIN_WIDTH)), skip, closed)
+    unknown = skip | np.isnan(centre)
     offsets = np.zeros(len(poly)) if unknown.all() else _bridge(np.nan_to_num(centre), unknown, closed)
-    sigma = max(1.0, p.stroke_width_sigma * prep.width)
+    sigma = max(1.0, p.stroke_width_sigma * mean_width)
     mode = "wrap" if closed else "nearest"
     return ndimage.gaussian_filter1d(widths, sigma, mode=mode), ndimage.gaussian_filter1d(offsets, sigma, mode=mode)
 
@@ -754,7 +895,7 @@ def _sample_lab(lab: np.ndarray, xy: np.ndarray) -> np.ndarray:
     return np.stack([ndimage.map_coordinates(lab[..., k], coords, order=1, mode="nearest") for k in range(3)], axis=1)
 
 
-def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
+def _ink(lab, pts, normals, guide, color, min_contrast, search=None, sides=None):
     """Ink coverage across the line at each point: (width, centre, ridge, peak). Width is in px,
     centre and ridge are offsets along `normals`, peak is the ink fraction at the ridge.
 
@@ -762,10 +903,11 @@ def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
     color; integrated across the line it is the width a line of exactly `color` needs to put down the
     same ink, so faint stretches come out thin. Each half of the cross-section, split at the ridge, is
     measured against its own side, so a line on the boundary of two regions works, and the two half
-    widths place the line's centre. The ridge is searched within `search` (default: the half width
-    + 1 px) of each point. Width, centre and peak are NaN where either side is within `min_contrast`
-    of the line color (crossings, line-colored neighbors). Samples further than INK_BLEND_TOL of the
-    contrast from every blend of side and line carry no ink.
+    widths place the line's centre. Side colors are read just beyond the line unless `sides` gives
+    them (Lab colors on the -normal and +normal side). The ridge is searched within `search`
+    (default: the half width + 1 px) of each point. Width, centre and peak are NaN where either side
+    is within `min_contrast` of the line color (crossings, line-colored neighbors). Samples further
+    than INK_BLEND_TOL of the contrast from every blend of side and line carry no ink.
     """
     half = 0.5 * np.maximum(guide, 1.0)
     reach = half + INK_SIDE_GAP
@@ -775,9 +917,12 @@ def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
     side_u = (reach[:, None] + np.arange(0.0, 1.0 + 1e-9, INK_STEP)[None, :])
     k = side_u.shape[1]
     fracs, ok = [], np.ones(n, dtype=bool)
-    for sgn in (-1.0, 1.0):
-        sp = pts[:, None, :] + (sgn * side_u)[..., None] * normals[:, None, :]
-        side = _sample_lab(lab, sp.reshape(-1, 2)).reshape(n, k, 3).mean(axis=1)
+    for si, sgn in enumerate((-1.0, 1.0)):
+        if sides is None:
+            sp = pts[:, None, :] + (sgn * side_u)[..., None] * normals[:, None, :]
+            side = _sample_lab(lab, sp.reshape(-1, 2)).reshape(n, k, 3).mean(axis=1)
+        else:
+            side = np.broadcast_to(np.asarray(sides[si], dtype=np.float64), (n, 3))
         v = color[None, :] - side
         vv = (v * v).sum(axis=1)
         ok &= vv >= min_contrast**2

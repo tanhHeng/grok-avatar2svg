@@ -27,6 +27,14 @@ def lab_to_hex(lab: np.ndarray) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def blend_curve(a: np.ndarray, b: np.ndarray, n: int = 33) -> np.ndarray:
+    """(n, 3) Lab colors of n sRGB blends from a to b: what anti-aliasing between the two produces,
+    which bends away from the straight Lab segment by several delta E for contrasting pairs."""
+    ra, rb = lab_to_rgb(a).astype(np.float64) / 255.0, lab_to_rgb(b).astype(np.float64) / 255.0
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    return rgb2lab(((1.0 - t) * ra + t * rb)[None])[0]
+
+
 def delta_e(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """CIE76 color difference along the last axis."""
     return np.linalg.norm(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64), axis=-1)

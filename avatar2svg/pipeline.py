@@ -17,7 +17,7 @@ from .params import Params
 from .planar import build_planar_map
 from .regions import region_areas, region_medians
 from .segment import segment
-from .strokes import extract_strokes
+from .strokes import boundary_strokes, extract_strokes
 from .subpixel import refine_edges
 from .svgout import build_svg
 
@@ -76,20 +76,22 @@ def vectorize(rgb: np.ndarray, opaque: np.ndarray, params: Params | None = None)
             smooth=p.px(p.smooth_region),
         )
     timings["fitting"] = time.perf_counter() - t
+    lines = step("boundary_lines", boundary_strokes, lab, pm, curves, labels, medians, stroke_mask, p)
 
     t = time.perf_counter()
     # Stroke pixels show the stroke color; masking them out keeps them from biasing region colors.
     color_labels = np.where(stroke_mask, 0, labels)
     fills = region_fills(lab, color_labels, p)
-    stroke_fills = [Fill(lab=np.array(s.color, dtype=np.float64)) for s in strokes]
+    stroke_fills = [Fill(lab=np.array(s.color, dtype=np.float64)) for s in strokes + lines]
     unify_colors(list(fills.values()) + stroke_fills, p)
     timings["coloring"] = time.perf_counter() - t
 
-    svg = step("svg", build_svg, pm, curves, fills, region_areas(labels), strokes, stroke_fills, p)
+    svg = step("svg", build_svg, pm, curves, fills, region_areas(labels), strokes + lines, stroke_fills, p)
     stats = {
         "segments": n_segments,
         "regions": int(labels.max()),
         "strokes": len(strokes),
+        "boundary_lines": len(lines),
         "nodes": len(pm.nodes),
         "edges": len(used),
         "edge_beziers": sum(len(curves[e]) for e in used),
