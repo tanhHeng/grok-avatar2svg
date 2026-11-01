@@ -3,9 +3,9 @@ from collections import Counter
 
 import numpy as np
 
-from avatar2svg.junctions import assign_tangents
-from avatar2svg.params import Params
-from avatar2svg.planar import build_planar_map
+from grok_avatar2svg.junctions import assign_tangents
+from grok_avatar2svg.params import Params
+from grok_avatar2svg.planar import build_planar_map
 
 
 def oriented(pm, eid, forward):

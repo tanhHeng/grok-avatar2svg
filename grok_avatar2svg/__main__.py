@@ -10,7 +10,7 @@ from .pipeline import load_image, vectorize
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="avatar2svg", description="Convert a flat-color avatar image into SVG.")
+    ap = argparse.ArgumentParser(prog="grok-avatar2svg", description="Convert a Grok bot-style raster avatar into transparent SVG.")
     ap.add_argument("input", type=Path)
     ap.add_argument("-o", "--output", type=Path, help="output SVG path (default: input with .svg suffix)")
     ap.add_argument("--gradients", action="store_true", help="emit linear gradients for regions that need them")

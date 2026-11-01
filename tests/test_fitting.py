@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from avatar2svg.fitting import bezier_eval, fit_open, fit_path
-from avatar2svg.geometry import unit
+from grok_avatar2svg.fitting import bezier_eval, fit_open, fit_path
+from grok_avatar2svg.geometry import unit
 
 
 def max_distance(curve, points):

@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from avatar2svg.params import Params
-from avatar2svg.segment import _reassign_offcolor
+from grok_avatar2svg.params import Params
+from grok_avatar2svg.segment import _reassign_offcolor
 
 DARK = (15.0, 0.0, -2.0)
 LIGHT = (89.0, 11.0, 3.0)

@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from avatar2svg.pipeline import vectorize
+from grok_avatar2svg.pipeline import vectorize
 
 HAS_RESVG = importlib.util.find_spec("resvg_py") is not None
 A = np.array([200, 60, 60])
@@ -24,7 +24,7 @@ def two_blocks() -> np.ndarray:
 @unittest.skipUnless(HAS_RESVG, "needs the optional resvg-py package")
 class Seams(unittest.TestCase):
     def test_shared_edge_shows_no_backdrop(self):
-        from avatar2svg.validate import render
+        from grok_avatar2svg.validate import render
 
         img = two_blocks()
         result = vectorize(img, np.ones(img.shape[:2], dtype=bool))
@@ -38,7 +38,7 @@ class Seams(unittest.TestCase):
         self.assertLess(float(off_segment.max()), 12.0)
 
     def test_background_stays_transparent(self):
-        from avatar2svg.validate import render
+        from grok_avatar2svg.validate import render
 
         img = two_blocks()
         result = vectorize(img, np.ones(img.shape[:2], dtype=bool))

@@ -3,13 +3,13 @@ import unittest
 import cv2
 import numpy as np
 
-from avatar2svg.colorspace import rgb_to_lab
-from avatar2svg.fitting import bezier_eval, fit_path
-from avatar2svg.geometry import signed_area
-from avatar2svg.params import Params
-from avatar2svg.planar import build_planar_map
-from avatar2svg.regions import region_medians
-from avatar2svg.strokes import (
+from grok_avatar2svg.colorspace import rgb_to_lab
+from grok_avatar2svg.fitting import bezier_eval, fit_path
+from grok_avatar2svg.geometry import signed_area
+from grok_avatar2svg.params import Params
+from grok_avatar2svg.planar import build_planar_map
+from grok_avatar2svg.regions import region_medians
+from grok_avatar2svg.strokes import (
     _Branch, _Graph, _Node, _outline_loops, _simplify_graph, boundary_strokes, extract_strokes,
 )
 

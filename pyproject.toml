@@ -3,9 +3,9 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "avatar2svg"
+name = "grok-avatar2svg"
 version = "0.1.0"
-description = "Convert Grok-bot-like flat-color avatars into SVG"
+description = "Convert Grok bot-style raster avatars into transparent SVGs"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
@@ -19,7 +19,7 @@ dependencies = [
 validate = ["resvg-py"]
 
 [project.scripts]
-avatar2svg = "avatar2svg.__main__:main"
+grok-avatar2svg = "grok_avatar2svg.__main__:main"
 
 [tool.setuptools]
-packages = ["avatar2svg"]
+packages = ["grok_avatar2svg"]

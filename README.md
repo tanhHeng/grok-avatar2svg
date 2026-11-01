@@ -1,6 +1,6 @@
-# avatar2svg
+# grok-avatar2svg
 
-Convert flat-color, Grok-bot-like AI avatars into compact SVG files built from filled paths.
+Convert Grok bot-style raster avatars into transparent SVGs with smooth fills and variable-width outlines.
 
 The input is a raster image made of color blocks and thin lines, such as `example.png`. The output is an SVG that:
 
@@ -24,11 +24,15 @@ pip install -e .              # core dependencies
 pip install -e ".[validate]"  # also install resvg-py for validation
 ```
 
+If pip installs into the user site, ensure its Scripts directory is on `PATH` so the `grok-avatar2svg` command can be found.
+
 ## Usage
 
 ```bash
-python -m avatar2svg example.png -o out/example.svg
+grok-avatar2svg example.png -o out/example.svg
 ```
+
+The CLI is installed as `grok-avatar2svg`. Alternatively, run `python -m grok_avatar2svg` with the same arguments.
 
 | Option | Description |
 | --- | --- |
@@ -43,8 +47,8 @@ From Python:
 ```python
 from pathlib import Path
 
-from avatar2svg.params import Params
-from avatar2svg.pipeline import load_image, vectorize
+from grok_avatar2svg.params import Params
+from grok_avatar2svg.pipeline import load_image, vectorize
 
 rgb, opaque = load_image("example.png")
 result = vectorize(rgb, opaque, Params(gradients=True))
@@ -52,7 +56,7 @@ Path("example.svg").write_text(result.svg, encoding="utf-8")
 print(result.stats)
 ```
 
-Every threshold lives in `avatar2svg/params.py`. Pixel values are given for a 1254 px image and scale with the input size.
+Every threshold lives in `grok_avatar2svg/params.py`. Pixel values are given for a 1254 px image and scale with the input size.
 
 ## How it works
 

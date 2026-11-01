@@ -3,13 +3,13 @@ import unittest
 import cv2
 import numpy as np
 
-from avatar2svg.colorspace import rgb_to_lab
-from avatar2svg.fitting import bezier_eval
-from avatar2svg.junctions import assign_tangents
-from avatar2svg.occlusion import link_contours
-from avatar2svg.params import Params
-from avatar2svg.planar import build_planar_map
-from avatar2svg.strokes import extract_strokes
+from grok_avatar2svg.colorspace import rgb_to_lab
+from grok_avatar2svg.fitting import bezier_eval
+from grok_avatar2svg.junctions import assign_tangents
+from grok_avatar2svg.occlusion import link_contours
+from grok_avatar2svg.params import Params
+from grok_avatar2svg.planar import build_planar_map
+from grok_avatar2svg.strokes import extract_strokes
 
 BAR_TOP, BAR_BOTTOM = 26, 36  # rows covered by the occluding bar: [26, 36)
 

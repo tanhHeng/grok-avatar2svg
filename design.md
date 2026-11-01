@@ -390,7 +390,7 @@ Schneider 原文用的是 4ε、4 次。样例上 16ε、8 次的贝塞尔段数
 
 调 ε、合并阈值、拐角阈值时以这三组数为准。作为参照，分割结果本身（每个像素直接填区域中位色）的 ΔE 90 分位是 1.8，99 分位是 7.8，SVG 应该落在同一量级。区域边界附近的 ΔE 如果明显高于这个参照，先查 8.2 的接缝处理。
 
-当前实现在样例上的结果（`python -m avatar2svg example.png --validate`）：
+当前实现在样例上的结果（`grok-avatar2svg example.png --validate`）：
 
 | 指标 | 默认（纯色） | `--gradients` |
 | --- | --- | --- |
@@ -457,9 +457,9 @@ Schneider 原文用的是 4ε、4 次。样例上 16ε、8 次的贝塞尔段数
 # 使用
 
 ```bash
-python -m avatar2svg example.png -o out/example.svg             # 输出 SVG
-python -m avatar2svg example.png -o out/example.svg --validate  # 同时打印第 9 节的指标，需要 resvg-py
-python -m avatar2svg example.png --gradients                    # 开启渐变
+grok-avatar2svg example.png -o out/example.svg             # 输出 SVG
+grok-avatar2svg example.png -o out/example.svg --validate  # 同时打印第 9 节的指标，需要 resvg-py
+grok-avatar2svg example.png --gradients                    # 开启渐变
 python -m unittest discover -s tests                            # 单元测试
 ```
 
