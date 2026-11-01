@@ -4,10 +4,14 @@ import cv2
 import numpy as np
 
 from avatar2svg.colorspace import rgb_to_lab
-from avatar2svg.fitting import bezier_eval
+from avatar2svg.fitting import bezier_eval, fit_path
 from avatar2svg.geometry import signed_area
 from avatar2svg.params import Params
-from avatar2svg.strokes import _Branch, _Graph, _Node, _outline_loops, _simplify_graph, extract_strokes
+from avatar2svg.planar import build_planar_map
+from avatar2svg.regions import region_medians
+from avatar2svg.strokes import (
+    _Branch, _Graph, _Node, _outline_loops, _simplify_graph, boundary_strokes, extract_strokes,
+)
 
 PALETTE = np.array([[0, 0, 0], [250, 240, 240], [200, 150, 160]], dtype=np.uint8)
 
@@ -126,6 +130,75 @@ class SpurPruning(unittest.TestCase):
     def test_spur_off_to_the_side_is_pruned(self):
         ends = self.fork((1.1, -1.1))
         self.assertFalse(any(np.allclose(e, [31.1, 28.9]) for e in ends))
+
+
+def clip_with_rim() -> tuple[np.ndarray, np.ndarray]:
+    """A white square (label 2) on pink (label 1) with a 3 px dark rim that merges, on its left
+    side, into a dark block of the same color: rim and block are one region (label 3)."""
+    labels = np.ones((120, 120), dtype=np.int32)
+    labels[37:83, 37:83] = 3
+    labels[40:80, 40:80] = 2
+    labels[30:90, 5:40] = 3
+    colors = np.array([[0, 0, 0], [250, 225, 230], [255, 255, 255], [190, 130, 140]], dtype=np.uint8)
+    return rgb_to_lab(cv2.GaussianBlur(colors[labels], (0, 0), 0.7)), labels
+
+
+class ThinLimbs(unittest.TestCase):
+    def test_rim_merged_into_a_block_becomes_a_stroke(self):
+        lab, labels = clip_with_rim()
+        out, strokes, mask = extract_strokes(lab, labels, Params())
+        self.assertEqual(len(strokes), 1)
+        center = np.vstack([bezier_eval(b, np.linspace(0.0, 1.0, 50)) for b in strokes[0].centerline[0]])
+        # The rim's right side covers columns 80-82.
+        self.assertAlmostEqual(float(center[:, 0].max()), 81.5, delta=1.0)
+        self.assertTrue(mask[60, 81])
+        self.assertEqual(set(np.unique(out).tolist()), {1, 2, 3})
+
+    def test_rim_on_the_background_stays_with_its_region(self):
+        lab, labels = clip_with_rim()
+        background = np.array([False, True, False, False])
+        out, strokes, _ = extract_strokes(lab, labels, Params(), background)
+        self.assertEqual(strokes, [])
+        np.testing.assert_array_equal(out, labels)
+
+
+def boundary_lines(lab: np.ndarray, labels: np.ndarray):
+    p = Params()
+    pm = build_planar_map(labels, p)
+    used = {eid for cycles in pm.cycles.values() for cyc in cycles for eid, _ in cyc}
+    curves = [fit_path(e.points, p.eps_region, closed=e.closed) if i in used else [] for i, e in enumerate(pm.edges)]
+    return boundary_strokes(lab, pm, curves, labels, region_medians(lab, labels), np.zeros(labels.shape, dtype=bool), p)
+
+
+def two_sides(left, right, line=None) -> tuple[np.ndarray, np.ndarray]:
+    """Label 1 left of x = 30, label 2 right of it; optionally a 2 px line over columns 29-30,
+    split between the two labels as the watershed does when the line gets no seed."""
+    labels = np.ones((120, 60), dtype=np.int32)
+    labels[:, 30:] = 2
+    img = np.array([left, right], dtype=np.uint8)[labels - 1]
+    if line is not None:
+        img[:, 29:31] = line
+    return rgb_to_lab(cv2.GaussianBlur(img, (0, 0), 0.7)), labels
+
+
+class BoundaryLines(unittest.TestCase):
+    def test_line_split_between_two_regions_is_drawn(self):
+        lab, labels = two_sides((240, 200, 205), (255, 255, 255), line=(190, 130, 140))
+        lines = boundary_lines(lab, labels)
+        self.assertEqual(len(lines), 1)
+        center = np.vstack([bezier_eval(b, np.linspace(0.0, 1.0, 50)) for b in lines[0].centerline[0]])
+        middle = np.abs(center[:, 1] - 60.0) < 30.0
+        self.assertLess(float(np.abs(center[middle, 0] - 30.0).max()), 0.3)
+        outline = outline_points(lines[0])
+        mean_width = abs(signed_area(outline)) / float(np.ptp(outline[:, 1]))
+        self.assertGreater(mean_width, 1.5)
+        self.assertLess(mean_width, 2.8)
+
+    def test_plain_boundary_draws_nothing(self):
+        # Anti-aliasing between red and green bends up to 28 delta E off the straight Lab segment
+        # between them; those colors are still blends of the two sides, not a line.
+        lab, labels = two_sides((255, 0, 0), (0, 255, 0))
+        self.assertEqual(boundary_lines(lab, labels), [])
 
 
 class CutEnds(unittest.TestCase):
