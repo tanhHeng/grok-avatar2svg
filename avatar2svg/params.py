@@ -36,6 +36,7 @@ class Params:
     ink_min_contrast: float = 4.0  # delta E between line and side color below which ink coverage is undefined
     tip_min_ink: float = 0.3  # traced tips end where the ridge holds less than this fraction of the line color
     tip_max_trace: float = 64.0  # px; a ridge still going beyond this is another feature, not a fading tip
+    limb_radius: float = 2.0  # px; parts of a region narrower than about 2r + 1 are tested as strokes on their own
 
     # 4. background
     bg_de: float = 3.0

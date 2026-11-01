@@ -89,12 +89,17 @@ class _Graph:
         return pts if which == 0 else pts[::-1]
 
 
-def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.ndarray, list[Stroke], np.ndarray]:
-    """Pull thin elongated regions out into strokes.
+def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params,
+                    background: np.ndarray | None = None) -> tuple[np.ndarray, list[Stroke], np.ndarray]:
+    """Pull thin elongated regions, and thin elongated parts of wider regions, out into strokes.
 
     Only ridges count: a region whose centerline mostly runs through flat color (a plateau) is a
     narrow color block, such as a hair strand, and stays a region; its two edges are placed and
-    fitted independently, which a centerline + width model cannot match.
+    fitted independently, which a centerline + width model cannot match. A thin part of a wider
+    region (design 3, "thin limbs") is typically an outline that merged with a block of its own
+    color; as a region its width would be the gap between two independently fitted edges.
+    `background` (bool per label) marks the regions that will be transparent; thin parts touching
+    them stay with their region.
 
     Width and centerline position come from the line's ink in `lab`, not from the region's shape
     (design 3, step 5). Returns the label map with stroke pixels given to the nearest non-stroke
@@ -105,16 +110,13 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
     """
     h, w = labels.shape
     flat = flat_mask(lab, p)
+    labels, parent = _split_limbs(labels, flat, background, p)
     preps: list[_Prepared] = []
     for idx, box in enumerate(ndimage.find_objects(labels)):
         if box is None:
             continue
         label = idx + 1
-        crop = labels[box] == label
-        skel = skeletonize(crop)
-        if not is_elongated(int(crop.sum()), int(skel.sum()), p):
-            continue
-        if float(flat[box][skel].mean()) >= p.stroke_max_plateau:
+        if not _line_shaped(labels[box] == label, flat[box], p):
             continue
         prep = _prepare(label, lab, labels, box, p)
         if prep is not None:
@@ -152,11 +154,72 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
         if stroke is not None:
             strokes.append(stroke)
             mask_all[stroke.pixels[:, 0], stroke.pixels[:, 1]] = True
+    # Limbs that did not become strokes go back to their region (the others are all under mask_all).
+    if parent:
+        lut = np.arange(int(labels.max()) + 1, dtype=labels.dtype)
+        lut[list(parent)] = list(parent.values())
+        labels = lut[labels]
     out = labels.copy()
     if strokes and not mask_all.all():
         _, (ri, ci) = ndimage.distance_transform_edt(mask_all, return_indices=True)
         out[mask_all] = labels[ri[mask_all], ci[mask_all]]
     return out, strokes, mask_all
+
+
+def _line_shaped(mask: np.ndarray, flat: np.ndarray, p: Params) -> bool:
+    """Stroke test of design section 3: thin and long, and the skeleton runs over a ridge, not a plateau."""
+    skel = skeletonize(mask)
+    if not is_elongated(int(mask.sum()), int(skel.sum()), p):
+        return False
+    return float(flat[skel].mean()) < p.stroke_max_plateau
+
+
+def _split_limbs(labels: np.ndarray, flat: np.ndarray, background: np.ndarray | None,
+                 p: Params) -> tuple[np.ndarray, dict[int, int]]:
+    """Give each thin part of a wide region that passes the stroke test a label of its own.
+
+    Thin parts are what a morphological opening with a disk of radius limb_radius removes. Parts
+    smaller than small_area are left alone: openings also shave corners and staircase pixels off
+    every boundary. Regions that are thin and long as a whole are skipped: they are strokes or
+    narrow color blocks, whose tapering ends belong to them. Background regions and parts touching
+    one are skipped too: like boundary lines, an outline against the transparent background stays
+    the region's edge, and carving it would join two edges of that outline into one refitted curve.
+    Returns the new label map and {limb label: region label}.
+    """
+    radius = max(int(round(p.px(p.limb_radius))), 1)
+    disk = np.hypot(*np.mgrid[-radius:radius + 1, -radius:radius + 1]) <= radius
+    min_area = p.area(p.small_area)
+    out = labels.copy()
+    parent: dict[int, int] = {}
+    next_label = int(labels.max()) + 1
+    h, w = labels.shape
+    for idx, box in enumerate(ndimage.find_objects(labels)):
+        if box is None:
+            continue
+        label = idx + 1
+        if background is not None and background[label]:
+            continue
+        r0, r1 = max(box[0].start - radius - 1, 0), min(box[0].stop + radius + 1, h)
+        c0, c1 = max(box[1].start - radius - 1, 0), min(box[1].stop + radius + 1, w)
+        mask = labels[r0:r1, c0:c1] == label
+        if is_elongated(int(mask.sum()), int(skeletonize(mask).sum()), p):
+            continue
+        # Edge padding: the image border must not count as the region's boundary.
+        opened = ndimage.binary_opening(np.pad(mask, radius, mode="edge"), structure=disk)
+        thin = mask & ~opened[radius:-radius, radius:-radius]
+        parts, n = ndimage.label(thin, structure=np.ones((3, 3), dtype=bool))
+        for k in range(1, n + 1):
+            part = parts == k
+            if part.sum() < min_area or not _line_shaped(part, flat[r0:r1, c0:c1], p):
+                continue
+            if background is not None:
+                touching = labels[r0:r1, c0:c1][ndimage.binary_dilation(part, structure=np.ones((3, 3), dtype=bool))]
+                if background[touching].any():
+                    continue
+            out[r0:r1, c0:c1][part] = next_label
+            parent[next_label] = label
+            next_label += 1
+    return out, parent
 
 
 @dataclass
