@@ -473,8 +473,21 @@ def _dissolve(graph: _Graph, nid: int) -> None:
     graph.branches[b1] = _Branch(np.vstack([p1, p2[1:]]), far1, far2)
 
 
+def _continues(graph: _Graph, bid: int, hub: int, width: float, p: Params) -> bool:
+    """Whether branch `bid` pairs with another branch at node `hub` (same pairing as _chains)."""
+    ends = graph.ends(hub)
+    r0, length = max(p.px(p.tangent_r0), width), p.px(p.tangent_len)
+    dirs = [direction_from_end(graph.away(b, w), r0, length) for b, w in ends]
+    k = next(i for i, (b, _) in enumerate(ends) if b == bid)
+    return any(k in pair for pair in pair_branches(dirs, p.pair_angle_deg))
+
+
 def _simplify_graph(graph: _Graph, width: float, p: Params) -> None:
-    """Prune spurs shorter than spur_factor * width and contract junction links shorter than width."""
+    """Prune spurs shorter than spur_factor * width and contract junction links shorter than width.
+
+    A short spur that leaves its junction straight on from another branch is kept: it is the start
+    of a tip that segmentation cut short (tip tracing extends it), not a skeleton fork at a corner.
+    """
     for nid in range(len(graph.nodes)):
         _dissolve(graph, nid)
     while True:
@@ -485,6 +498,7 @@ def _simplify_graph(graph: _Graph, width: float, p: Params) -> None:
             if br.alive and not br.closed and br.a != br.b
             and sorted((deg[br.a], deg[br.b]))[0] == 1 and max(deg[br.a], deg[br.b]) >= 3
             and br.length < p.spur_factor * width
+            and not _continues(graph, bid, br.a if deg[br.a] >= 3 else br.b, width, p)
         ]
         links = [
             (br.length, bid)
