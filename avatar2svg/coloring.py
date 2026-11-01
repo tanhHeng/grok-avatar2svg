@@ -1,4 +1,5 @@
-"""Region and stroke colors (design.md section 7): robust median fill, optional linear gradient, color unification."""
+"""Region colors (design.md section 7): robust median fill, optional linear gradient; color unification
+across region and stroke fills (stroke colors come from strokes.py, which measures widths against them)."""
 
 from __future__ import annotations
 
@@ -33,17 +34,6 @@ def region_fills(lab: np.ndarray, labels: np.ndarray, p: Params) -> dict[int, Fi
         mask = _pad_mask(labels[box] == label, rows.start, rows.stop, cols.start, cols.stop, h, w)
         fills[label] = _fill(lab, mask, rows.start, cols.start, p, p.gradients)
     return fills
-
-
-def stroke_fill(lab: np.ndarray, pixels: np.ndarray, p: Params) -> Fill:
-    """Flat fill of one stroke given its (M, 2) int (row, col) pixels."""
-    h, w = lab.shape[:2]
-    pixels = np.asarray(pixels, dtype=np.int64)
-    r0, c0 = pixels.min(axis=0)
-    r1, c1 = pixels.max(axis=0) + 1
-    mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
-    mask[pixels[:, 0] - r0, pixels[:, 1] - c0] = True
-    return _fill(lab, _pad_mask(mask, r0, r1, c0, c1, h, w), r0, c0, p, False)
 
 
 def unify_colors(fills: list[Fill], p: Params) -> None:

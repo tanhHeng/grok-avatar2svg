@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from .background import detect_background
-from .coloring import region_fills, stroke_fill, unify_colors
+from .coloring import Fill, region_fills, unify_colors
 from .colorspace import rgb_to_lab
 from .fitting import fit_path
 from .junctions import assign_tangents
@@ -80,7 +80,7 @@ def vectorize(rgb: np.ndarray, opaque: np.ndarray, params: Params | None = None)
     # Stroke pixels show the stroke color; masking them out keeps them from biasing region colors.
     color_labels = np.where(stroke_mask, 0, labels)
     fills = region_fills(lab, color_labels, p)
-    stroke_fills = [stroke_fill(lab, s.pixels, p) for s in strokes]
+    stroke_fills = [Fill(lab=np.array(s.color, dtype=np.float64)) for s in strokes]
     unify_colors(list(fills.values()) + stroke_fills, p)
     timings["coloring"] = time.perf_counter() - t
 

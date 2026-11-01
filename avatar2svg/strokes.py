@@ -28,6 +28,9 @@ CUT_WIDTH_RATIO = 0.6
 CUT_MIN_SIN = 0.7
 # Pixels of contact a third region needs around a free end to count as the occluder.
 TIP_CONTACT_MIN = 3
+# Cross-section sampling for ink coverage: step, and how far beyond the half width the side colors are read.
+INK_STEP = 0.25
+INK_SIDE_GAP = 2.5
 
 
 @dataclass
@@ -36,6 +39,7 @@ class Stroke:
     pixels: np.ndarray  # (M, 2) int (row, col)
     outline: list[Curve]  # closed subpaths for fill-rule nonzero: positive signed_area, ring holes negative
     centerline: list[Curve]  # fitted centerline per chain
+    color: np.ndarray  # Lab fill; outline widths put down the image's ink only when drawn in this color
 
 
 @dataclass
@@ -87,10 +91,11 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
     narrow color block, such as a hair strand, and stays a region; its two edges are placed and
     fitted independently, which a centerline + width model cannot match.
 
-    Returns the label map with stroke pixels given to the nearest non-stroke label (so the regions
-    underneath meet along each stroke's medial axis), the strokes, and the stroke pixel mask.
-    Free ends cut by an occluder (design 3, 5.5) end flat along the occluder's outline, and cut
-    ends facing each other across the same occluder share one joint curve.
+    Width and centerline position come from the line's ink in `lab`, not from the region's shape
+    (design 3, step 5). Returns the label map with stroke pixels given to the nearest non-stroke
+    label (so the regions underneath meet along each stroke's medial axis), the strokes, and the
+    stroke pixel mask. Free ends cut by an occluder (design 3, 5.5) end flat along the occluder's
+    outline, and cut ends facing each other across the same occluder share one joint curve.
     """
     h, w = labels.shape
     flat = flat_mask(lab, p)
@@ -164,7 +169,7 @@ class _Prepared:
     mask: np.ndarray  # region crop
     dist: np.ndarray  # distance transform of the crop
     width: float  # mean width A / l
-    color: np.ndarray  # median Lab of the region
+    color: np.ndarray  # median Lab along the skeleton: the line's core color, without its anti-aliased rim
     chains: list[_Chain]
 
     def width_at(self, xy: np.ndarray) -> np.ndarray:
@@ -206,7 +211,7 @@ def _prepare(label: int, lab: np.ndarray, labels: np.ndarray, box: tuple[slice, 
     if not graph.branches:
         return None
     _simplify_graph(graph, width, p)
-    color = np.median(lab[r0:r1, c0:c1][mask], axis=0)
+    color = np.median(lab[r0:r1, c0:c1][skel], axis=0)
     prep = _Prepared(label, r0, c0, mask, dist, width, color, [])
     junction_pos = [n.pos for n in graph.nodes if n.junction]
     for pts, closed, free in _chains(graph, width, p):
@@ -214,7 +219,9 @@ def _prepare(label: int, lab: np.ndarray, labels: np.ndarray, box: tuple[slice, 
         if len(poly) < 2:
             continue
         poly = _smooth_chain(poly, closed, p.px(p.smooth_stroke))
-        widths = _width_profile(poly, prep.width_at, junction_pos, width, closed, p.stroke_width_sigma)
+        normals = _normals(poly, closed)
+        widths, offsets = _line_profile(poly, normals, lab, prep, junction_pos, closed, p)
+        poly = poly + offsets[:, None] * normals
         prep.chains.append(_Chain(poly, widths, closed, free))
     return prep if prep.chains else None
 
@@ -343,7 +350,7 @@ def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], p: Params) -> St
             outline.append(fit_path(loop, eps, closed=True))
     if not outline:
         return None
-    return Stroke(prep.label, prep.pixels(), outline, centerline)
+    return Stroke(prep.label, prep.pixels(), outline, centerline, prep.color)
 
 
 def _skeleton_graph(skel: np.ndarray, origin: np.ndarray) -> _Graph:
@@ -570,25 +577,48 @@ def _smooth_chain(poly: np.ndarray, closed: bool, sigma: float) -> np.ndarray:
     return smooth_piece(poly, sigma)
 
 
-def _width_profile(poly, width_at, junction_pos, width, closed, sigma_factor) -> np.ndarray:
-    """Widths from the distance transform, bridged across junctions (where the region is wider than
-    any single line through it) and smoothed over about one stroke width."""
-    widths = width_at(poly)
-    bad = np.zeros(len(poly), dtype=bool)
+def _normals(poly: np.ndarray, closed: bool) -> np.ndarray:
+    tang = np.roll(poly, -1, axis=0) - np.roll(poly, 1, axis=0) if closed else np.gradient(poly, axis=0)
+    tang /= np.maximum(np.linalg.norm(tang, axis=1, keepdims=True), 1e-12)
+    return np.stack([tang[:, 1], -tang[:, 0]], axis=1)
+
+
+def _line_profile(poly, normals, lab, prep: _Prepared, junction_pos, closed, p: Params) -> tuple[np.ndarray, np.ndarray]:
+    """Width and centre offset (along `normals`) per centerline sample, from ink coverage.
+
+    The skeleton runs mid-way through the stroke region, which can sit a few tenths of a pixel off
+    the line's ink; the offset moves the centerline onto it. Where ink is undefined the width falls
+    back to the distance transform and the offset is interpolated. Samples near junctions, where the
+    region is wider than any single line through it, are bridged from both sides, then both profiles
+    are smoothed over about one stroke width.
+    """
+    edt = prep.width_at(poly)
+    ink, centre, _, _ = _ink(lab, poly, normals, edt, prep.color, p.ink_min_contrast)
+    near_junction = np.zeros(len(poly), dtype=bool)
     for jp in junction_pos:
-        radius = 0.5 * float(width_at(jp[None, :])[0]) + 1.0
-        bad |= np.linalg.norm(poly - jp, axis=1) < radius
-    if bad.any() and not bad.all():
-        idx = np.arange(len(poly))
-        if closed:
-            n = len(poly)
-            good = idx[~bad]
-            ext = np.concatenate([good - n, good, good + n])
-            widths[bad] = np.interp(idx[bad], ext, np.tile(widths[good], 3))
-        else:
-            widths[bad] = np.interp(idx[bad], idx[~bad], widths[~bad])
-    sigma = max(1.0, sigma_factor * width)
-    return ndimage.gaussian_filter1d(widths, sigma, mode="wrap" if closed else "nearest")
+        radius = 0.5 * float(prep.width_at(jp[None, :])[0]) + 1.0
+        near_junction |= np.linalg.norm(poly - jp, axis=1) < radius
+    widths = _bridge(np.where(np.isnan(ink), edt, np.maximum(ink, MIN_WIDTH)), near_junction, closed)
+    unknown = near_junction | np.isnan(centre)
+    offsets = np.zeros(len(poly)) if unknown.all() else _bridge(np.nan_to_num(centre), unknown, closed)
+    sigma = max(1.0, p.stroke_width_sigma * prep.width)
+    mode = "wrap" if closed else "nearest"
+    return ndimage.gaussian_filter1d(widths, sigma, mode=mode), ndimage.gaussian_filter1d(offsets, sigma, mode=mode)
+
+
+def _bridge(values: np.ndarray, bad: np.ndarray, closed: bool) -> np.ndarray:
+    """Replace `bad` samples by linear interpolation between the good ones (all bad: unchanged)."""
+    if not bad.any() or bad.all():
+        return values
+    values = values.copy()
+    idx = np.arange(len(values))
+    good = idx[~bad]
+    if closed:
+        n = len(values)
+        values[bad] = np.interp(idx[bad], np.concatenate([good - n, good, good + n]), np.tile(values[good], 3))
+    else:
+        values[bad] = np.interp(idx[bad], good, values[good])
+    return values
 
 
 def _complete_tips(poly, widths, free, inside, width):
@@ -615,6 +645,58 @@ def _complete_tips(poly, widths, free, inside, width):
             tapered[side] = True
         poly, widths = (pts, ws) if side == 0 else (pts[::-1], ws[::-1])
     return poly, widths, (tapered[0], tapered[1])
+
+
+def _sample_lab(lab: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    """Bilinear Lab at (N, 2) xy points (pixel centers at +0.5)."""
+    coords = [xy[:, 1] - 0.5, xy[:, 0] - 0.5]
+    return np.stack([ndimage.map_coordinates(lab[..., k], coords, order=1, mode="nearest") for k in range(3)], axis=1)
+
+
+def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
+    """Ink coverage across the line at each point: (width, centre, ridge, peak). Width is in px,
+    centre and ridge are offsets along `normals`, peak is the ink fraction at the ridge.
+
+    The ink fraction of a pixel is how far its color has moved from the side color toward the line
+    color; integrated across the line it is the width a line of exactly `color` needs to put down the
+    same ink, so faint stretches come out thin. Each half of the cross-section, split at the ridge, is
+    measured against its own side, so a line on the boundary of two regions works, and the two half
+    widths place the line's centre. The ridge is searched within `search` (default: the half width
+    + 1 px) of each point. Width, centre and peak are NaN where either side is within `min_contrast`
+    of the line color (crossings, line-colored neighbors).
+    """
+    half = 0.5 * np.maximum(guide, 1.0)
+    reach = half + INK_SIDE_GAP
+    us = np.arange(-reach.max(), reach.max() + 1e-9, INK_STEP)
+    n, m = len(pts), len(us)
+    cs = _sample_lab(lab, (pts[:, None, :] + us[None, :, None] * normals[:, None, :]).reshape(-1, 2)).reshape(n, m, 3)
+    side_u = (reach[:, None] + np.arange(0.0, 1.0 + 1e-9, INK_STEP)[None, :])
+    k = side_u.shape[1]
+    fracs, ok = [], np.ones(n, dtype=bool)
+    for sgn in (-1.0, 1.0):
+        sp = pts[:, None, :] + (sgn * side_u)[..., None] * normals[:, None, :]
+        side = _sample_lab(lab, sp.reshape(-1, 2)).reshape(n, k, 3).mean(axis=1)
+        v = color[None, :] - side
+        vv = (v * v).sum(axis=1)
+        ok &= vv >= min_contrast**2
+        fracs.append(((cs - side[:, None, :]) * v[:, None, :]).sum(axis=2) / np.maximum(vv, 1e-9)[:, None])
+    f_lo, f_hi = fracs
+    limit = half + 1.0 if search is None else np.broadcast_to(np.asarray(search, dtype=np.float64), (n,))
+    peak_f = np.where(np.abs(us)[None, :] <= limit[:, None], np.minimum(f_lo, f_hi), -np.inf)
+    j = np.argmax(peak_f, axis=1)
+    idx = np.arange(m)[None, :]
+    inside = np.abs(us)[None, :] <= reach[:, None]
+    c_lo, c_hi = (np.clip(f, 0.0, 1.0) * inside for f in (f_lo, f_hi))
+    at = idx == j[:, None]
+    w_lo = ((c_lo * (idx < j[:, None])).sum(axis=1) + 0.5 * (c_lo * at).sum(axis=1)) * INK_STEP
+    w_hi = ((c_hi * (idx > j[:, None])).sum(axis=1) + 0.5 * (c_hi * at).sum(axis=1)) * INK_STEP
+    width = w_lo + w_hi
+    ridge = us[j]
+    centre = ridge + 0.5 * (w_hi - w_lo)
+    peak = peak_f[np.arange(n), j]
+    for a in (width, centre, peak):
+        a[~ok] = np.nan
+    return width, centre, ridge, peak
 
 
 def _sample_curve(curve: Curve, closed: bool) -> np.ndarray:

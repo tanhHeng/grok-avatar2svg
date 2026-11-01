@@ -33,6 +33,7 @@ class Params:
     stroke_min_elongation: float = 4.0
     stroke_max_plateau: float = 0.3
     spur_factor: float = 1.5
+    ink_min_contrast: float = 4.0  # delta E between line and side color below which ink coverage is undefined
 
     # 4. background
     bg_de: float = 3.0
