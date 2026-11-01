@@ -1,466 +1,468 @@
+**[English](design.md)** | [简体中文](design.zh-CN.md)
+
 # What's this?
 
 This project converts Grok-bot-like AI-generated avatars into SVG.
 
-目标是输出一份**只由填充路径构成**的 SVG：边界平滑，相邻色块之间没有缝，节点尽量少。只追求还原度和体积，不考虑输出在编辑器里好不好改。背景输出为透明。
+The goal is an SVG **made entirely of filled paths**: smooth boundaries, no gaps between adjacent color regions, and as few nodes as possible. Fidelity and file size are the only priorities; ease of editing the output in an editor is not a consideration. The background is transparent.
 
-照片、纹理、复杂光影不在考虑范围内。
+Photos, textures, and complex lighting are out of scope.
 
-# 样例观察
+# Sample observations
 
-先看 `example.png` 实际长什么样，再决定算法。下面的数值都是对原图统计得到的：
+First, examine what `example.png` actually looks like, then choose the algorithm. All figures below were measured from the original image:
 
-| 观察项 | 数值 | 对算法的影响 |
+| Observation | Value | Implication for the algorithm |
 | --- | --- | --- |
-| 尺寸 | 1254×1254，RGB，无 alpha | 背景要自己判定 |
-| 平坦像素占比（5×5 窗口内 L\* 标准差 < 0.8） | 88% | 画面主体是色块 |
-| 平坦区内的噪声 | 每通道 σ ≈ 0.5 | 取色用中位数，去噪可选 |
-| 不同 RGB 颜色数 | 32862 | 几乎都来自抗锯齿和噪声 |
-| 覆盖 80% / 99% 平坦像素所需的 Lab 颜色桶（桶宽 3） | 14 / 57 | 有效调色板只有几十色 |
-| 色块边缘的过渡宽度 | 多为 2–4 px，个别 6 px | 边界要做亚像素定位 |
-| 线条 | 没有黑色描线；线条是同色系更深的细长色块，宽 2–10 px（中位约 4 px），两端常为尖头 | 线宽必须可变，不能用固定 `stroke-width` |
-| 背景色 / 眼睛颜色 | ≈ RGB(36,37,39) / ≈ RGB(35,35,37) | 按颜色抠背景会把眼睛一起抠掉 |
-| 大色块内部的颜色跨度（1–99 分位） | 多数 ≤ 3 ΔE，少数 5–6 ΔE；中央刘海一块约 7.6 万 px 的区域沿一个方向渐变约 10 ΔE | 大部分是纯色；渐变输出做成可选项 |
+| Dimensions | 1254×1254, RGB, no alpha | The background must be identified explicitly |
+| Flat-pixel proportion (L\* standard deviation < 0.8 in a 5×5 window) | 88% | Most of the image consists of color regions |
+| Noise in flat areas | σ ≈ 0.5 per channel | Use the median for color sampling; denoising is optional |
+| Number of distinct RGB colors | 32862 | Almost all come from antialiasing and noise |
+| Lab color bins needed to cover 80% / 99% of flat pixels (bin width 3) | 14 / 57 | The effective palette contains only a few dozen colors |
+| Transition width at region edges | Mostly 2–4 px, occasionally 6 px | Boundaries need subpixel localization |
+| Lines | No black outlines; lines are darker, elongated regions in the same color family, 2–10 px wide (median about 4 px), often with pointed ends | Width must vary; a fixed `stroke-width` will not work |
+| Background color / eye color | ≈ RGB(36,37,39) / ≈ RGB(35,35,37) | Removing the background by color would also remove the eyes |
+| Color range inside large regions (1st–99th percentile) | Mostly ≤ 3 ΔE, occasionally 5–6 ΔE; a region of about 76,000 px in the central bangs varies by about 10 ΔE along one direction | Most regions are solid colors; gradient output should be optional |
 
-本文的 ΔE 指 CIELAB 空间中的欧氏距离（ΔE76），L\* 取值 0–100。
+Throughout this document, ΔE means Euclidean distance in CIELAB space (ΔE76), with L\* in the range 0–100.
 
-另外用一个简易分割原型（第 2 节的平坦种子 + 分水岭 + 颜色合并，不含细线种子和小区域合并）在样例上跑了一遍：
+A simple segmentation prototype was also run on the sample (the flat seeds + watershed + color merging from section 2, without thin-line seeds or small-region merging):
 
-- 得到 116 个区域。每个像素直接填所在区域的中位色，ΔE 的 90 分位为 1.8，99 分位为 7.8；
-- ΔE > 5 的像素有 59% 落在区域边界 4 px 以内（抗锯齿过渡带），剩下的几乎全在中央刘海那块渐变区里。那块区域改用线性模型拟合后，残差方差下降 71%；
-- 三个区域交汇的点共 168 处。能判定方向的交汇点里，T 型 78 个，Y 型 5 个；
-- 判定不了的 82 个里，有 67 个紧挨着细线条色块。
+- It produced 116 regions. Filling each pixel directly with its region's median color gave a 90th-percentile ΔE of 1.8 and a 99th-percentile ΔE of 7.8;
+- Of pixels with ΔE > 5, 59% were within 4 px of a region boundary (the antialiasing transition band). Almost all the rest were in the gradient region in the central bangs. Fitting that region with a linear model reduced residual variance by 71%;
+- There were 168 points where three regions met. Among junctions whose directions could be determined, 78 were T-junctions and 5 were Y-junctions;
+- Of the 82 junctions that could not be classified, 67 were immediately adjacent to thin-line regions.
 
-由此得到三个结论，它们决定了后面的整体结构：
+These observations lead to three conclusions that determine the overall structure below:
 
-1. **先分割，后描边。** 边缘检测（滤镜或 CNN）在这类图上会给每条细线产生两条平行边缘，低对比度的边界还会断开。它不产出闭合区域，上色时还得再补一次缝。分割直接给出闭合区域，边界的拓扑天然一致。
-2. **线条单独成层**，用「中心线 + 宽度曲线」表达。细线如果当普通色块处理，两侧边界各拟合各的，线宽会抖，尖头会变钝；而且细线周围的交汇点最难判定。
-3. **交点以 T 型为主。** T 型交点要求横杠两侧的两条边共用切线，轮廓穿过交点时是否平滑，主要取决于这条约束。
+1. **Segment first, then trace boundaries.** Edge detection (filters or CNNs) produces two parallel edges for every thin line in this kind of image, and low-contrast boundaries can break apart. It does not produce closed regions, so gaps still need to be repaired before coloring. Segmentation gives closed regions directly, with inherently consistent boundary topology.
+2. **Put lines on a separate layer**, represented as a centerline plus a width profile. Treating thin lines as ordinary regions means fitting their two boundaries independently, which makes widths wobble and tips become blunt; junctions around thin lines are also the hardest to classify.
+3. **Most junctions are T-junctions.** At a T-junction, the two edges forming the crossbar must share a tangent. Whether the contour passes smoothly through the junction depends primarily on this constraint.
 
-# 总体流程
+# Overall pipeline
 
 ```mermaid
 flowchart TD
-    A[预处理] --> B[色块分割]
-    B --> D[背景判定]
-    D --> C[线条提取]
-    C --> E[边界图与交点分类]
-    E --> O[遮挡连续性]
-    O --> F[曲线拟合]
-    F --> L[边界线]
-    L --> G[上色]
-    G --> H[分层与输出]
-    H --> I[回归校验]
-    C -- 笔画中心线与宽度 --> F
+    A[Preprocessing] --> B[Region segmentation]
+    B --> D[Background identification]
+    D --> C[Line extraction]
+    C --> E[Boundary graph and junction classification]
+    E --> O[Occlusion continuity]
+    O --> F[Curve fitting]
+    F --> L[Boundary lines]
+    L --> G[Coloring]
+    G --> H[Layering and output]
+    H --> I[Regression validation]
+    C -- Stroke centerlines and widths --> F
 ```
 
-下文所有像素参数都以 1254 px 为基准，其他尺寸的图按 `max(W, H) / 1254` 线性缩放（8.2 的垫底描边宽度除外）。参数汇总在[参数表](#参数表)。
+All pixel parameters below use 1254 px as the reference size. For other image sizes, scale them linearly by `max(W, H) / 1254` (except the underlay stroke width in 8.2). The parameters are summarized in the [parameter table](#parameter-table).
 
-## 1. 预处理
+## 1. Preprocessing
 
-1. 转到 CIELAB。后面所有颜色距离都在这个空间里算。
-2. 去噪默认关闭。样例的噪声只有 σ ≈ 0.5，不影响平坦判定。输入是 JPEG 或噪声明显时，用小半径双边滤波 (bilateral filter)。不要用高斯模糊，它会加宽边缘过渡带。
-3. 输入带 alpha 时，alpha = 0 的像素直接归为背景。
+1. Convert to CIELAB. All subsequent color distances are calculated in this space.
+2. Denoising is disabled by default. The sample's noise is only σ ≈ 0.5 and does not affect flatness classification. For JPEG input or visibly noisy images, use a small-radius bilateral filter. Do not use Gaussian blur: it widens edge transition bands.
+3. If the input has alpha, assign pixels with alpha = 0 directly to the background.
 
-## 2. 色块分割
+## 2. Region segmentation
 
-输出一张标签图 (label map)：每个像素属于哪个区域。
+Produce a label map indicating which region each pixel belongs to.
 
-**平坦种子。** 3×3 窗口内 L\* 标准差 < 1.0 的像素算平坦像素。相邻平坦像素之间 ΔE < 1.2 就连通，连通块面积 ≥ 12 px 的留作种子。
+**Flat seeds.** A pixel is flat if the L\* standard deviation in its 3×3 window is < 1.0. Connect adjacent flat pixels when their ΔE is < 1.2, and retain connected components with area ≥ 12 px as seeds.
 
-窗口为什么是 3×3？5×5 窗口下，2–4 px 宽的细线里一个平坦像素都没有，整条线会被旁边的色块吞掉。样例中这样做有 26% 的线条像素被分到了 ΔE > 6 的区域；改成 3×3 后降到 16%。
+Why a 3×3 window? With a 5×5 window, lines 2–4 px wide contain no flat pixels at all, so the entire line is swallowed by neighboring regions. On the sample, this assigned 26% of line pixels to regions with ΔE > 6; switching to 3×3 reduced that to 16%.
 
-**细线种子。** 剩下这 16% 是最细的线，需要单独补一路脊线检测 (ridge detection)：
+**Thin-line seeds.** The remaining 16% are the thinnest lines and need a separate ridge-detection pass:
 
-- 对 L\* 做黑帽变换 (black-hat，15 px 圆形核)，响应 > 8 的连通块（≥ 40 px）就是暗细线；
-- 亮细线（发卡、高光）用白帽变换 (top-hat)，参数相同；
-- 把这些连通块骨架化，每段骨架作为一个额外种子。
+- Apply a black-hat transform to L\* (15 px circular kernel). Connected components with response > 8 and area ≥ 40 px are dark thin lines;
+- Use a top-hat transform for bright thin lines (hair clips and highlights), with the same parameters;
+- Skeletonize these connected components and use each skeleton segment as an additional seed.
 
-**扩张。** 以三通道 Sobel 梯度幅值之和为高度，做带标记分水岭 (marker-based watershed)。过渡带里的像素会归到梯度脊线两侧的种子，分界落在梯度最大处，也就是两色各占一半的位置附近。
+**Expansion.** Run marker-based watershed, using the sum of the three channels' Sobel gradient magnitudes as the height map. Pixels in transition bands are assigned to seeds on either side of the gradient ridge. The dividing boundary falls at the maximum gradient, near the position where the two colors contribute equally.
 
-**合并。** 在区域邻接图 (Region Adjacency Graph, RAG) 上：
+**Merging.** On the Region Adjacency Graph (RAG):
 
-- 相邻区域中位色 ΔE < 2.5 的合并；
-- 面积 < 50 px 且不细长（不满足第 3 节的笔画条件）的区域，并入 ΔE 最近的邻居。
+- Merge adjacent regions whose median colors have ΔE < 2.5;
+- Merge regions with area < 50 px that are not elongated (do not meet the stroke criteria in section 3) into the neighbor with the closest color by ΔE.
 
-**按颜色修正边界像素。** 分水岭只看梯度，不看颜色，偶尔会把一条 1 px 宽的异色像素分给旁边的区域。样例上最典型的情况是：头发外缘有一圈比背景还暗的晕边（L\* 5–10，背景约 15），黑帽变换把它和头发深色描边当成同一条暗线，种子连成一片，结果晕边像素被分进了描边区域（L\* 约 72）。轮廓在 V 形缺口里本该凹进去，画出来却多了一根描边色的尖刺。
+**Correct boundary-pixel assignments by color.** Watershed considers gradients, not colors, and can occasionally assign a 1 px strip of differently colored pixels to a neighboring region. The clearest example in the sample is a halo around the outer hair edge that is darker than the background (L\* 5–10, compared with about 15 for the background). The black-hat transform treats this halo and the dark hair outline as one dark line, joining their seeds. As a result, halo pixels are assigned to the outline region (L\* about 72). Instead of receding into a V-shaped notch, the rendered contour gains an outline-colored spike.
 
-合并之后对边界像素再检查一遍：像素离某个 4 邻域区域的颜色比离自己区域近 10 ΔE 以上，而且离那个区域不超过 15 ΔE，就改归那个区域。最多做 3 轮，每轮剥掉一层像素。第二个条件是给抗锯齿像素留的：它们是两种颜色的混合，可能恰好比第三个区域的颜色更近，但并不像它。比如深色与浅色各半的像素离描边色约 22 ΔE，不会被拉进描边区域。
+After merging, check boundary pixels again: if a pixel is more than 10 ΔE closer to the color of a region in its 4-neighborhood than to its own region's color, and is no more than 15 ΔE from that target region, reassign it to that region. Run at most 3 passes, peeling off one pixel layer per pass. The second condition protects antialiased pixels: mixtures of two colors may happen to be closer to a third region's color without actually resembling it. For example, a pixel mixing dark and light colors equally is about 22 ΔE from the outline color, so it will not be pulled into the outline region.
 
-改归之后，区域可能被切出几小块。一个区域只保留最大的 4 连通块；其余小于 50 px 的碎块，并入与它共享边界最长的邻居，否则会画成小斑点。
+Reassignment can split a region into several pieces. Retain only its largest 4-connected component; merge any remaining fragments smaller than 50 px into the neighbor with which they share the longest boundary, or they would render as small spots.
 
-样例上这一步移动了约 140 个像素。「离邻居颜色近 10 ΔE 以上」的像素从 114 个降到 44 个，剩下的都是上面说的混合像素。
+On the sample, this step moved about 140 pixels. The number of pixels more than 10 ΔE closer to a neighbor's color fell from 114 to 44; all the remaining ones were the mixed pixels described above.
 
-颜色相同但不相邻的两块保持为两个区域，输出时再按颜色合并 path。
+Nonadjacent regions of the same color remain separate regions. Their paths are merged by color during output.
 
-种子连通和区域合并都只比较相邻的颜色，会沿着渐变一路传下去。样例中央刘海那块区域在种子阶段就已经连成一片（7.2 万 px，跨度约 10 ΔE）。这正是想要的：渐变区保持为一个区域，由第 7 节决定填纯色还是渐变。
+Seed connectivity and region merging compare only neighboring colors, so connectivity propagates along a gradient. The region in the central bangs is already connected during seeding (72,000 px, spanning about 10 ΔE). This is intentional: keep a gradient area as a single region, then let section 7 decide whether to use a solid fill or a gradient.
 
-## 3. 线条提取
+## 3. Line extraction
 
-**判定。** 对每个区域算面积 A、骨架像素数 ℓ、平均宽度 w = A / ℓ。同时满足下面两条的区域判为笔画 (stroke)：
+**Classification.** For each region, calculate its area A, skeleton pixel count ℓ, and average width w = A / ℓ. Classify it as a stroke if both conditions hold:
 
-- **细长**：w ≤ 12 px 且 ℓ / w ≥ 4；
-- **没有平台**：骨架像素里，落在平坦像素（第 2 节的 3×3 判据）上的比例 < 0.3。
+- **Elongated**: w ≤ 12 px and ℓ / w ≥ 4;
+- **No plateau**: the proportion of skeleton pixels that are flat pixels (the 3×3 criterion in section 2) is < 0.3.
 
-第二条区分「线」和「窄色块」。线的横截面是一道山脊，亮度降到最低马上又回升，中间没有平的一段；发束这类窄色块的横截面中间是一段平的填充色。样例里两类之间有明显的空档：真正的线这个比例是 0–0.2，窄色块是 0.38 以上。
+The second condition distinguishes lines from narrow color regions. A line's cross section is a ridge: luminance reaches a minimum and immediately rises again, with no flat interval in between. A narrow region such as a lock of hair has a plateau of fill color in the middle of its cross section. In the sample, the two categories have a clear gap: this proportion is 0–0.2 for actual lines and at least 0.38 for narrow color regions.
 
-只看细长会把窄色块也当成线，用「中心线 + 宽度」画出来就成了波浪：骨架在色块里游走，距离变换给出的宽度时宽时窄。窄色块留作区域后，两条边各自做亚像素定位和拟合（第 6 节），这样画出来很平滑。这个判据依赖抗锯齿：完全没有抗锯齿的 3 px 线中间一列也是平的，会被当成色块，但 AI 生成的图都有抗锯齿。
+Using elongation alone would also classify narrow color regions as lines. Drawing them with a centerline and width produces waves: the skeleton wanders within the region, and the distance-transform width alternates between wide and narrow. Keeping narrow color regions as regions lets both boundaries undergo separate subpixel localization and fitting (section 6), producing smooth results. This criterion depends on antialiasing: the middle column of a completely un-antialiased 3 px line is also flat, so it would be treated as a region, but AI-generated images have antialiasing.
 
-样例的 147 个区域里，细长的有 65 个，其中 29 个是线，宽度中位约 3 px。
+Of the sample's 147 regions, 65 are elongated, of which 29 are lines, with a median width of about 3 px.
 
-**细部。** 有的描边和旁边一块同色的色块连在一起，分割时并成了一个区域。样例里发卡的深色描边（宽约 2.6 px）和压在发卡下面的一缕深色头发同色，整圈描边成了那缕头发区域伸出去的细边。作为区域的一部分，描边的宽度就是两条边界各自拟合后的间距。两条边各有 0.6 px 的拟合误差和 σ = 3 px 的平滑，叠在一起，2–3 px 的描边就会一段宽一段窄：样例里发卡下沿有一处，描边从 2.4 px 被拟合成了 1.6 px。
+**Thin details.** Some outlines connect to an adjacent region of the same color and are merged with it during segmentation. In the sample, a hair clip's dark outline (about 2.6 px wide) has the same color as a dark lock of hair beneath it, so the entire outline becomes a thin extension of that hair region. As part of a region, the outline's width is the distance between two independently fitted boundaries. Each boundary has a fitting error of 0.6 px and smoothing with σ = 3 px; together, they make a 2–3 px outline alternately thick and thin. At one point along the sample's lower hair-clip edge, an outline originally 2.4 px wide was fitted as 1.6 px.
 
-所以判定之前，先对每个不细长的区域做一次开运算（半径 2 px 的圆盘），开运算去掉的部分就是窄于约 5 px 的细部。细部面积 ≥ 50 px、并且本身满足上面两条判据的，单独拿出来当笔画。面积门槛是为了跳过开运算顺带削掉的拐角和阶梯像素。细长的区域整个跳过：它要么本身就是笔画，要么是窄色块，窄色块渐细的末端属于它自己。
+Before classification, therefore, apply a morphological opening to every non-elongated region (a disk of radius 2 px). The portions removed by the opening are details narrower than about 5 px. Extract a detail as a separate stroke if its area is ≥ 50 px and it independently meets both criteria above. The area threshold skips corners and staircase pixels removed incidentally by the opening. Skip elongated regions entirely: each is either already a stroke or a narrow color region, and a narrow region's tapering end belongs to that region.
 
-紧挨背景的细部也不拆。和后面的边界线一样，前景对透明背景的轮廓保持为区域的边。而且拆掉以后，细部两侧的区域会在笔画下面接上，原来的两条边连成一条重新拟合，误差会摊到整条边上：样例头顶有一处这样的细部，拆开后那条 500 px 长的头发外轮廓整体偏了约 0.4 px。为此背景判定挪到了线条提取之前（第 4 节）。
+Do not extract details immediately adjacent to the background either. As with the boundary lines described later, the foreground contour against the transparent background remains a region edge. Extracting such a detail would also connect the regions on either side underneath the stroke, joining the original two edges into one that must be refitted. The error would then spread across the entire edge: at one such detail on top of the sample's head, extraction shifted the full 500 px outer hair contour by about 0.4 px. This is why background identification comes before line extraction (section 4).
 
-样例上拆出 5 个细部，其中 4 个是两枚发卡的描边。
+The sample yields 5 extracted details, 4 of which are outlines of the two hair clips.
 
-每个笔画按下面的步骤处理：
+Process each stroke as follows:
 
-1. **骨架图。** 骨架化，以骨架像素为节点建图。对角相邻的两个像素只有在不共享 4 邻居时才连边，避免阶梯处出现假分叉。度为 1 的像素是端点，度 ≥ 3 的相连像素合成一个分叉簇。
-2. **化简。** 先消掉度为 2 的节点，再反复执行：剪掉长度 < 1.5w 的毛刺 (spur)；两个分叉簇之间的分支短于 w 时合成一个簇。两条细线交叉时，骨架会裂成两个相距很近的三叉点，这一步把它们并回一个。
+1. **Skeleton graph.** Skeletonize the region and build a graph with skeleton pixels as nodes. Connect diagonally adjacent pixels only if they share no 4-neighbor, avoiding false branches at staircase steps. Degree-1 pixels are endpoints; connected pixels of degree ≥ 3 form a branch cluster.
+2. **Simplification.** First eliminate degree-2 nodes, then repeat: prune spurs shorter than 1.5w; merge two branch clusters if the branch between them is shorter than w. When two thin lines cross, the skeleton can split into two nearby three-way junctions; this step merges them back into one.
 
-   有一种毛刺不剪：它沿着同一分叉簇的另一条分支笔直延续，按第 3 步的方法能和那条分支配成对。这是被分割截短的线头，不是骨架在角上分出的叉。剪掉它，线会在分叉处拐进旁边的分支，画出一个方向不对的钩。样例里衣领上方有一根线就是这样：线头只剩 1 px 骨架，旁边是一条 10 px 长的淡色分支，原先画出来的线在线头处拐了个直角。
-3. **串成笔画链。** 在每个分叉簇按 5.2、5.3 的方法估计各分支方向（r0 = max(3 px, w)），夹角 < 25° 的两条分支配对。从端点出发沿骨架走，只经配对分支穿过分叉簇；每条分支只走一次，最后剩下的闭环从任意点出发。这样一条穿过交叉点的线是一整条平滑曲线，而不是四段。
-4. **平滑中心线。** 链按 1 px 重采样后做 σ = 4 px 的高斯平滑。开链两端先按端点做点对称延拓再滤波，所以端点位置和端点方向都不变。骨架有 ±0.5 px 的阶梯，而且会在线里来回游走，不平滑的话拟合会跟着走出波浪。样例上，这一步让中心线拐点从每 100 px 5.2 个降到 2.4 个。
-5. **宽度和位置。** 宽度按线在原图里的「墨量」算。沿法向取横截面，一个像素的墨量是它的颜色从旁边色块往线色移动了多少，取值 0–1；把整个横截面的墨量加起来，就是用线色画出同样多的墨需要多宽。淡下去的一段墨少，画出来就细。
+   Do not prune a spur that continues straight from another branch in the same branch cluster and can be paired with it by the method in step 3. This is a line tip shortened by segmentation, not an incidental skeleton branch at a corner. Pruning it makes the line turn into the adjacent branch at the junction, drawing a hook in the wrong direction. One line above the collar in the sample had exactly this problem: its tip retained only 1 px of skeleton, next to a 10 px pale branch, and the rendered line originally made a right-angle turn at the tip.
+3. **Build stroke chains.** At each branch cluster, estimate branch directions using 5.2 and 5.3 (r0 = max(3 px, w)), and pair branches whose angle is < 25°. Start at endpoints and follow the skeleton, passing through branch clusters only via paired branches. Traverse each branch once, then start any remaining closed loops at an arbitrary point. A line passing through a crossing is thus one smooth curve rather than four segments.
+4. **Smooth centerlines.** Resample each chain at 1 px intervals, then apply Gaussian smoothing with σ = 4 px. Before filtering an open chain, extend both ends by point reflection about their endpoints, preserving both endpoint positions and directions. Skeletons have ±0.5 px staircase errors and wander within lines; without smoothing, fitting follows them into waves. On the sample, this step reduced centerline inflections from 5.2 to 2.4 per 100 px.
+5. **Width and position.** Calculate width from the line's “ink amount” in the original image. Take a cross section along the normal. A pixel's ink amount is how far its color has moved from the neighboring region color toward the line color, on a scale of 0–1. Summing the ink across the cross section gives the width needed to draw the same amount of ink in the line color. A faded section contains less ink and is drawn thinner.
 
-   横截面在山脊（墨量最大处）分成两半，每一半对照自己那一侧的颜色，所以落在两个色块分界上的线也能量。两半各自的宽度还给出线的中心：骨架在笔画区域正中，可区域边界是分水岭定的，可能偏离线的墨迹零点几个像素，中心线按两半的差挪过去。
+   Split the cross section into two halves at the ridge (the maximum ink amount), and compare each half against the color on its own side. This also measures lines lying on boundaries between two color regions. The two half-widths also determine the line's center: the skeleton is centered within the stroke region, but the region boundary is set by watershed and may be a few tenths of a pixel away from the actual ink. Shift the centerline by the difference between the halves.
 
-   墨量是相对线色算的，所以输出必须用同一个颜色。线色取骨架像素的中位数，也就是线心的颜色，不含抗锯齿边。某一侧和线色的 ΔE < 4 时（交叉处、紧挨着同色的色块）墨量没有意义，宽度退回 2 × 距离变换值，中心不挪。分叉簇附近的区域比任何一条线都宽，这一段的宽度和中心偏移都用两侧插值。
+   Ink amount is measured relative to the line color, so output must use that same color. Take the median color of skeleton pixels: the color at the line's center, excluding antialiased edges. If the ΔE between either side and the line color is < 4 (at crossings or next to a same-colored region), ink amount is not meaningful. Fall back to 2 × the distance-transform value for width and do not shift the center. Near branch clusters, the region is wider than any individual line; interpolate both width and center offset across this interval from either side.
 
-   横截面里如果混进了另一个更深的东西，比如描边外侧不远就是背景，它的像素投影到「侧边色 → 线色」方向上会远超 1，截断成 1 以后就被算成了线的墨，线因此变宽。所以离侧边色和线色之间的混色太远的样本不算墨，容差是两者色差的一半，至少 4 ΔE。
+   If another, darker object appears in the cross section—for example, the background close to the outside of an outline—its pixels project far beyond 1 in the “side color → line color” direction. Clamping them to 1 would count them as line ink and widen the line. Therefore, do not count samples too far from a mixture of the side and line colors as ink. The tolerance is half the color difference between those colors, with a minimum of 4 ΔE.
 
-   最后宽度和偏移都用 σ = 2w 平滑。窗口太短会一鼓一瘪：距离变换是量化的，3 px 左右的线会在 2 px 和 4 px 之间跳；墨量是连续的，但带着原图线条本身的粗细起伏。对距离变换宽度，σ = 2w 让鼓包（起伏 ≥ 0.3 px 的局部极值）从每 100 px 4.1 个降到 1.6 个。尖头在平滑之后才补上，不受影响。
+   Finally, smooth both width and offset with σ = 2w. Too short a window produces bulges and pinches: the distance transform is quantized, so widths around 3 px jump between 2 px and 4 px. Ink amount is continuous, but still carries the original line's thickness variations. For distance-transform widths, σ = 2w reduces bulges (local extrema with variation ≥ 0.3 px) from 4.1 to 1.6 per 100 px. Pointed ends are added only after smoothing and are unaffected.
 
-   在样例上，墨量宽度和 2 × 距离变换的中位比值是 1.05，整体没有变粗或变细，差别在局部：淡的一段画细了，被区域带偏的线挪回了墨迹上。偏移量的中位数是 0.04 px，90 分位 0.19 px。和距离变换相比：
+   On the sample, the median ratio of ink-based width to 2 × the distance transform is 1.05, so lines are not thicker or thinner overall. The differences are local: faded sections become thinner, and lines displaced by their regions move back onto the ink. The median offset is 0.04 px, and the 90th percentile is 0.19 px. Compared with the distance transform:
 
-   - 笔画 3 px 以内 ΔE 的均值从 3.72 降到 3.27，95 分位从 10.7 降到 8.8，99 分位从 32.5 降到 25.5；
-   - 平滑后的鼓包从每 100 px 1.56 个降到 1.26 个；
-   - 中心线拐点从每 100 px 3.2 个增加到 3.6 个。这是在现在的 29 个笔画上重新统计的（曲率越过 ±1/150 px⁻¹ 才算一次变号），和第 4 步的数字不是同一批线。偏移量只有零点几个像素，看不出波浪。
-6. **端点分类。** 每个自由端（骨架端点，不是分叉簇）分成两种：
-   - **截断端**：靠近端点的宽度（距端点 0.5w–2w 的中位数）不低于整条链中位数的 60%，而且端点外紧挨着的区域不是线两侧的区域。先沿端点方向探 6 px；探到的是线两侧的区域时，改看端点 w 范围内接触最多的第三个区域（至少 3 px）。短链的端点方向常被分叉簇带偏，靠后者兜底。还要求遮挡物的轮廓与线足够陡地相交，夹角正弦 ≥ 0.7（约 45°）；更平的话，线其实是贴着那条轮廓走，并没有被挡住。截断端说明线被前面的东西挡住了，见 5.5；
-   - **自然端**：其余情况。分割常把线头淡下去的那一截分给周围的色块，笔画区域提前结束，画出来像被剪断了；线中间淡的一段也会这样被切走，一根线变成两截。所以自然端先沿原图里的山脊往外追。从端点往回退 w 起步，因为骨架末端常弯向区域的一个角。每走 0.5 px，在法向 ±1 px 内找墨量最大的位置，新方向七成沿用旧方向、三成跟随山脊，这样不会被单个像素的噪声带偏。追到下面任一情况为止：
-     - 山脊处的墨量低于 0.3：线淡没了，宽度在最后 w 内收成尖头；
-     - 山脊上的像素既不属于这个笔画，也不属于两侧的色块，说明撞上了另一个笔画或色块：用圆头结束。断成两截的线就这样接上；
-     - 某一侧的颜色和线色 ΔE < 4：线贴上了同色的东西，也用圆头结束。
+   - Within 3 px of strokes, mean ΔE drops from 3.72 to 3.27, the 95th percentile from 10.7 to 8.8, and the 99th percentile from 32.5 to 25.5;
+   - Bulges after smoothing drop from 1.56 to 1.26 per 100 px;
+   - Centerline inflections increase from 3.2 to 3.6 per 100 px. These figures were recalculated on the current 29 strokes (a sign change counts only when curvature crosses ±1/150 px⁻¹), not the same set of lines as in step 4. The offsets are only a few tenths of a pixel and produce no visible waves.
+6. **Endpoint classification.** Classify each free end (a skeleton endpoint, not a branch cluster) as one of two types:
+   - **Truncated end**: the width near the endpoint (the median at distances 0.5w–2w from it) is at least 60% of the entire chain's median, and the region immediately beyond the endpoint is not one of the regions on either side of the line. First probe 6 px along the endpoint direction. If the probe reaches one of the side regions, instead use the third region with the most contact within w of the endpoint (at least 3 px). Endpoint directions of short chains are often skewed by branch clusters, so this second method provides a fallback. The occluder's contour must also intersect the line steeply enough: the sine of the intersection angle must be ≥ 0.7 (about 45°). At a shallower angle, the line is actually following the contour rather than being occluded. A truncated end means something in front is hiding the line; see 5.5;
+   - **Natural end**: all other cases. Segmentation often assigns the fading tip of a line to surrounding color regions, ending the stroke region too early and making the rendered line look cut off. A faded section in the middle can likewise be removed, splitting one line in two. For natural ends, first trace the ridge outward in the original image. Start w back from the endpoint, because the skeleton's end often bends toward a corner of the region. At every 0.5 px step, find the maximum ink amount within ±1 px along the normal. Set the new direction to 70% of the old direction and 30% of the ridge direction, so single-pixel noise does not deflect it. Stop at any of these conditions:
+     - Ink amount at the ridge falls below 0.3: the line has faded away; taper the width to a point over the last w;
+     - The ridge pixel belongs neither to this stroke nor to either side region, indicating another stroke or region has been reached: end with a round cap. This reconnects lines that were split in two;
+     - The ΔE between either side's color and the line color is < 4: the line has reached something of the same color; also end with a round cap.
 
-     延长段的宽度就是一路量到的墨量，平滑方式同第 5 步。如果追了 64 px 山脊还没结束、追出了图像，或者连原来的端点都没越过，说明这不是一个淡出的线头，改用区域来补：沿端点切线向外走到离开区域，走出的距离 > 0.75 × 端点宽度时是尖头，宽度在延长段上线性降到 0；否则是圆头。
+     The extension's width is the ink amount measured along the trace, smoothed as in step 5. If tracing still has not ended after 64 px, leaves the image, or never even passes the original endpoint, this is not a fading tip. Fall back to the region: follow the endpoint tangent outward until leaving the region. If the distance traveled is > 0.75 × the endpoint width, use a pointed end, decreasing width linearly to 0 over the extension; otherwise use a round cap.
 
-     样例的 57 个自然端里，37 个追踪成功，其中 25 个淡出成尖头，最长的延长 51 px。
+     Of the sample's 57 natural ends, 37 were traced successfully, including 25 that faded to points. The longest extension was 51 px.
 
-   分叉簇处的链端点一律用圆头，它们被交叉的另一条线盖住。
-7. **截断端处理。** 中心线延长到线和遮挡物的交界点；端点 w 以内的宽度固定为截断宽度，到 2w 处过渡回实测宽度。轮廓在交界点沿遮挡物轮廓的方向（附近遮挡物边界像素的主方向）平切，不加尖头或圆头。
+   Chain endpoints at branch clusters always use round caps; the crossing line covers them.
+7. **Handle truncated ends.** Extend the centerline to the intersection between the line and its occluder. Keep width fixed at the truncated-end width within w of the endpoint, transitioning back to the measured width at 2w. Cut the contour flat at the intersection in the direction of the occluder's contour (the principal direction of nearby occluder-boundary pixels), without a pointed or round cap.
 
-   斜着切一条宽为 w 的线，切口一侧会越过中心线端点 (w/2)·cot θ，θ 是切线与线的夹角。θ 很小时，平切就变成一根长尖刺。样例上原先有 8 个截断端的 sin θ 在 0.27–0.66 之间，其中一处在线头上多出 3.6 px 的尖。第 6 步的 0.7 门槛把这类端点改判成自然端；拟合后的中心线方向若和判定时略有偏差，生成轮廓时同样用 0.7 兜底，退回垂直切。现在越过端点的部分最多约 w/2。
-8. **中心线拟合。** 见第 6 节，ε = 0.4 px。
-9. **生成轮廓。** 沿拟合后的中心线每 0.5 px 采样，向两侧法向各偏移 w(s)/2，加上圆头、尖头或平切，再对这个闭合轮廓拟合一次贝塞尔曲线（ε = 0.4 px）。偏移曲线不是贝塞尔曲线，只能重新拟合。同一笔画的多条链用 nonzero 规则填充，重叠处自然合并。
-10. **底图补洞。** 每个笔画像素改成离它最近的非笔画像素的标签，两侧色块在笔画中线处相接。这样底图里没有窄缝，笔画画在上层。细部拆出来的笔画也一样，原来的区域在笔画下面和邻居相接。
+   An oblique cut across a line of width w extends beyond the centerline endpoint on one side by (w/2)·cot θ, where θ is the angle between the cutting tangent and the line. At small θ, this flat cut becomes a long spike. Originally, 8 truncated ends in the sample had sin θ between 0.27–0.66, and one gained a 3.6 px spike. The 0.7 threshold in step 6 reclassifies these as natural ends. If the fitted centerline direction differs slightly from the direction used for classification, apply the same 0.7 safeguard when generating the contour, falling back to a perpendicular cut. The extension beyond the endpoint is now at most about w/2.
+8. **Fit centerlines.** See section 6, with ε = 0.4 px.
+9. **Generate contours.** Sample the fitted centerline every 0.5 px, offset each side along the normal by w(s)/2, add round caps, pointed ends, or flat cuts, then fit the resulting closed contour with Bézier curves again (ε = 0.4 px). An offset curve is not itself a Bézier curve, so it must be refitted. Fill multiple chains of the same stroke with the nonzero rule, naturally merging overlaps.
+10. **Fill holes in the base image.** Change each stroke pixel's label to that of its nearest non-stroke pixel, so the regions on either side meet at the stroke's centerline. This leaves no narrow gaps in the base image, and strokes are drawn above it. The same applies to strokes extracted as thin details: the original region meets its neighbors underneath the stroke.
 
-### 边界线
+### Boundary lines
 
-还有一种描边连区域都没分到。它和一侧的对比度很低，没有种子，分水岭把它的像素分给两侧的色块，边界正好从线中间穿过，线就没了。上面那枚发卡左端就是这样：描边 L\* 约 74，旁边那缕头发 L\* 约 82，只差 8 ΔE，黑帽响应 8–10，在阈值附近断断续续，整段描边被两边分掉，白色直接贴着头发。
+Some outlines do not even get their own region. Their contrast against one side is too low to produce a seed; watershed assigns their pixels to the regions on either side, placing the boundary through the line's center and making it disappear. This happens at the left end of the upper hair clip: the outline has L\* about 74 and the adjacent lock of hair about 82, a difference of only 8 ΔE. Its black-hat response of 8–10 is intermittent around the threshold, so the entire outline is divided between the two sides, leaving white directly against the hair.
 
-这一步在曲线拟合（第 6 节）之后做，沿每条两侧都是前景的边找：
+Run this step after curve fitting (section 6), searching along every edge with foreground regions on both sides:
 
-1. **找墨。** 沿拟合后的边每 1 px 取一个横截面，范围是两侧各 3 px。抗锯齿只能产生两侧颜色在 sRGB 里的混色，所以拿每个像素的颜色和这条混色曲线比，离曲线 ≥ 5 ΔE 的就是第三种颜色的墨。混色曲线在 Lab 里是弯的，红绿之间最多偏离直线 28 ΔE，不能用 Lab 直线段代替。取样用像素本身的颜色，不插值：在 Lab 里插值，硬边两侧之间会插出 Lab 直线段上的颜色，正好落在混色曲线外面。
-2. **排除别人的抗锯齿。** 墨点 2 px 以内有第三个区域的不算，那是第三个区域自己的抗锯齿；离已有笔画 3 px 以内的也不算。
-3. **成线。** 连续的墨点（允许 2 px 空档）至少 12 px 长才算一条线，线色取墨点颜色的中位数。线色和较近一侧的差还要至少是两侧色差的 0.2 倍。眼睛外圈有一道比眼珠还暗的细边，只比眼珠暗 6 ΔE，可眼白和眼珠差 85 ΔE。这么淡的边落在这么陡的边界上，本来就在边界的抗锯齿范围里，画出来挪动陡边的代价和它带来的改善相当：样例上这样的 11 条，一半变好一半变差。
-4. **量宽度。** 按第 5 步量墨，侧边色取线外侧那一点的颜色，渐变区域就按它在边附近的颜色比较。那一点要是落进了第三个区域（比如另一侧是条窄色块），改用这条边上那个区域的中位色。超过一半的横截面量不出墨（和一侧的色差 < 4 ΔE）的整条丢掉；个别量不出的地方宽度记为 0，线在那里淡出。
-5. **线头。** 离边的端点不到 4 px 的线头延长到端点，用圆头：线通常会接着沿下一条边走，或者走进一块和它同色的区域，端点附近的样本只是被第 2 步的间距条件去掉了。其余线头在最后 w 内收成尖头。
+1. **Find ink.** Take a cross section every 1 px along the fitted edge, extending 3 px to either side. Antialiasing can only produce mixtures of the two side colors in sRGB, so compare each pixel's color with that mixture curve. A distance ≥ 5 ΔE from the curve indicates ink of a third color. The mixture curve is curved in Lab space: between red and green it can deviate from a straight line by up to 28 ΔE, so a straight Lab segment is not a valid substitute. Sample actual pixel colors without interpolation: Lab interpolation across a hard edge would invent colors on the straight Lab segment, outside the mixture curve.
+2. **Exclude other regions' antialiasing.** Discard ink points within 2 px of a third region, because they are that region's own antialiasing. Also discard points within 3 px of an existing stroke.
+3. **Form lines.** A continuous run of ink points (allowing gaps of 2 px) must be at least 12 px long to count as a line. Use the median color of its ink points as the line color. Its color difference from the closer side must also be at least 0.2 times the difference between the two sides. The eye has a thin outer rim darker than the iris, but only by 6 ΔE, while the white of the eye and the iris differ by 85 ΔE. Such a faint rim at such a sharp boundary already lies within the boundary's antialiasing range. The cost of shifting that sharp boundary to draw it is comparable to the improvement it brings: among 11 such lines in the sample, half improved and half worsened.
+4. **Measure widths.** Measure ink as in step 5 above, using the color at the point just outside the line as the side color, so gradient regions are compared using their color near the edge. If that point falls into a third region (for example, when the other side is a narrow color region), use the median color of the intended region along this edge instead. Discard the entire line if more than half its cross sections cannot yield an ink measurement (color difference from one side < 4 ΔE). At isolated unmeasurable locations, set width to 0 so the line fades out there.
+5. **Line ends.** Extend a line end less than 4 px from the edge's endpoint to that endpoint, using a round cap: the line usually continues along the next edge or enters a region of the same color, and samples near the endpoint were merely removed by step 2's clearance condition. Taper other line ends to points over the last w.
 
-边界线画在笔画层，和笔画一样按颜色合并。样例上找出 36 条。
+Draw boundary lines on the stroke layer, merging them by color just like strokes. The sample yields 36 boundary lines.
 
-发卡的描边现在由三部分组成：自己成区域的部分本来就是笔画，并进头发的部分作为细部拆出来，被分掉的部分由边界线补上。沿上面那枚发卡的轮廓量描边宽度，原来有 41 个采样点的宽度不到原图的 3/4，现在只剩 2 个；宽度的平均偏差从 0.40 px 降到 0.27 px。描边整体比原图宽约 0.15 px。
+A hair clip's outline now consists of three parts: portions with their own regions were already strokes; portions merged into the hair are extracted as thin details; portions divided between neighboring regions are restored as boundary lines. Measuring outline width along the upper hair clip's contour, 41 sample points originally had less than 3/4 of the original width; now only 2 do. Mean width deviation drops from 0.40 px to 0.27 px. Overall, the outline is about 0.15 px wider than in the original.
 
-## 4. 背景判定
+## 4. Background identification
 
-这一步在线条提取之前做，因为拆细部（第 3 节）要知道哪些区域会变透明。前两步只标出背景区域；等线条提取完、笔画像素改给相邻区域以后，再做第 3 步。
+Run this before line extraction, because extracting thin details (section 3) requires knowing which regions will become transparent. The first two steps only mark background regions. Run step 3 after line extraction has reassigned stroke pixels to neighboring regions.
 
-1. 取图像四条边上的所有像素，按 ΔE 2.5 聚类，最大簇的中位色记为 c_bg。
-2. 背景 = **与图像边框连通**、且中位色与 c_bg 的 ΔE < 3 的区域集合。
+1. Take all pixels along the image's four sides, cluster them at ΔE 2.5, and denote the median color of the largest cluster as c_bg.
+2. Background = the set of regions **connected to the image border** whose median colors have ΔE < 3 from c_bg.
 
-注意只能沿连通性找，不能全局按颜色匹配。样例的眼睛和背景只差约 1 ΔE，但眼睛被脸包住，不与边框连通，这样才能保住。
+Follow connectivity only; do not match colors globally. The sample's eyes differ from the background by only about 1 ΔE, but they are enclosed by the face and disconnected from the border. This is what preserves them.
 
-3. 所有背景区域合并为同一个标签，**不输出**，画布上对应的位置保持透明。前景与背景之间的边界就是前景区域的外轮廓。
-4. 记下 c_bg，第 9 节校验时把 SVG 叠到 c_bg 上再和原图比较。
+3. Merge all background regions into one label and **do not output them**. Their positions on the canvas remain transparent. Boundaries between foreground and background form the foreground regions' outer contours.
+4. Record c_bg. During validation in section 9, composite the SVG over c_bg before comparing it with the original image.
 
-背景选透明，是因为给透明 SVG 垫一块纯色很容易，反过来从 SVG 里去掉背景却要重新处理边缘。
+The background is transparent because adding a solid background to a transparent SVG is easy, whereas removing a background from an SVG requires reprocessing the edges.
 
-## 5. 边界图与交点分类
+## 5. Boundary graph and junction classification
 
-### 5.1 建图
+### 5.1 Graph construction
 
-在标签图的像素网格上建平面图 (planar map)：
+Build a planar map on the label map's pixel grid:
 
-- **边界**：两侧标签不同的像素分隔边 (crack edge)；
-- **节点**：2×2 像素块内出现 ≥ 3 个不同标签的格点，以及边界与图像边框的交点。相距 ≤ 2 px 的节点合为一个簇，取质心；
-- **边**：两个节点之间的一串分隔边。每条边恰好被左右两个区域共享。没有节点的闭合边界（腮红、眼睛）是一条首尾相接的环。
+- **Boundaries**: pixel-dividing edges (crack edges) with different labels on either side;
+- **Nodes**: grid vertices where a 2×2 pixel block contains ≥ 3 distinct labels, plus intersections of boundaries with the image border. Merge nodes within ≤ 2 px into a cluster, using its centroid;
+- **Edges**: chains of crack edges between two nodes. Every edge is shared by exactly two regions, one on either side. A closed boundary without nodes (blush or eyes) is a loop joining back to itself.
 
-节点合并后，两端落在同一个簇、长度不超过 2 × 簇半径 + 2 px 的边直接删掉，它们只是簇内部的碎边。删掉后各区域的边界环仍然首尾相接，因为这些边的两端都吸到了同一个簇心。
+After merging nodes, delete edges whose ends fall in the same cluster and whose length is no more than 2 × the cluster radius + 2 px: these are only fragments inside the cluster. Region boundary loops remain connected after deletion because both ends of each removed edge have snapped to the same cluster center.
 
-这里有一条硬约束：**每条边只拟合一次**，两侧区域引用同一条曲线，一个正向、一个反向。这样几何上就不存在缝隙和重叠。逐色描边的做法（例如对每种颜色分别跑 potrace）做不到这一点，相邻色块之间一定会有缝或重叠。
+One constraint is mandatory: **fit each edge only once**, with the two adjacent regions referencing the same curve in opposite directions. This geometrically eliminates gaps and overlaps. Tracing colors independently (for example, running potrace separately for each color) cannot achieve this: adjacent regions will inevitably have gaps or overlaps.
 
-### 5.2 切线估计
+### 5.2 Tangent estimation
 
-交点周围 2–3 px 内的像素被抗锯齿和阶梯走样污染，方向不可信，所以要离开交点一段再看。
+Pixels within 2–3 px of a junction are contaminated by antialiasing and staircase aliasing, so their directions are unreliable. Estimate directions some distance away instead.
 
-对每条入射边，取弧长在 [r0, r0 + 8 px] 范围内的点，用主成分分析 (PCA) 拟合直线，得到这条边离开节点的单位方向 d_i。r0 = max(3 px, 局部线宽)。边太短时用全部可用点。
+For each incident edge, take points at arc lengths in [r0, r0 + 8 px] and fit a line using principal component analysis (PCA). This gives the unit direction d_i of the edge leaving the node. Set r0 = max(3 px, local line width). If the edge is too short, use all available points.
 
-### 5.3 分类
+### 5.3 Classification
 
-对节点的每一对入射边 (i, j)，**连续性代价** = d_i 与 −d_j 的夹角。代价为 0° 表示 i、j 能连成一条笔直穿过节点的线。
+For each pair of incident edges (i, j) at a node, the **continuity cost** is the angle between d_i and −d_j. A cost of 0° means i and j can form a straight line through the node.
 
-| 节点度 | 判定 | 类型 | 拟合约束 |
+| Node degree | Criterion | Type | Fitting constraint |
 | --- | --- | --- | --- |
-| 1 | 笔画骨架的端点 | 端点：线条的起点或终点 | 按第 3 节补全笔尖 |
-| 3 | 代价最小的一对 < 25° | T 型：一条线的终点撞到另一条线上 | i、j 共用切线（G1 连续），第三条边独立 |
-| 3 | 否则 | Y 型：三条线交于一点，互不延续 | 三条边各用各的切线，节点是尖角 |
-| 4 | 三种两两配对中总代价最小的那种，两对都 < 25° | X 型：两条线交叉穿过 | 每一对共用切线 |
-| 4 | 否则 | 拆成 T 或 Y | 代价 < 25° 的那一对共用切线，其余独立 |
+| 1 | Endpoint of a stroke skeleton | Endpoint: the start or end of a line | Complete the tip as in section 3 |
+| 3 | The lowest-cost pair has cost < 25° | T-junction: one line ends against another | i and j share a tangent (G1 continuity); the third edge is independent |
+| 3 | Otherwise | Y-junction: three lines meet without continuing into one another | Each edge has its own tangent; the node is a sharp corner |
+| 4 | Choose the pairing with the lowest total cost among the three possible pairings; both pairs have cost < 25° | X-junction: two lines cross through each other | Each pair shares a tangent |
+| 4 | Otherwise | Split into T- or Y-junctions | A pair with cost < 25° shares a tangent; the others are independent |
 
-初稿列出的三种交点分别对应 X 型、T 型和端点。补充的 Y 型在色块边界上常见（三个色块交于一点，谁也不延续）。样例的区域边界图里没有出现度为 4 的节点，X 型主要出现在笔画骨架上。
+The initial draft's three junction types correspond to X-junctions, T-junctions, and endpoints. The additional Y-junction type is common on color-region boundaries (three regions meet with none continuing through). The sample's region boundary graph has no degree-4 nodes; X-junctions occur mainly on stroke skeletons.
 
-### 5.4 边内部的拐角
+### 5.4 Corners inside edges
 
-拐角不在节点上，但和交点一样是曲线必须经过、而且切线在此断开的点。
+A corner is not a graph node, but like a junction it is a point the curve must pass through, with a discontinuous tangent.
 
-沿每条边按弧长每 1 px 重采样。在点 p 处取前后各 4 px 的点，算转角 φ(p)。φ 是局部极大值且 > 60° 的点为拐角，边在这里切开。发丝的尖端就是典型拐角。
+Resample each edge at 1 px arc-length intervals. At each point p, use points 4 px before and after it to calculate the turning angle φ(p). A point where φ is a local maximum and > 60° is a corner; split the edge there. Hair tips are typical corners.
 
-### 5.5 遮挡连续性
+### 5.5 Occlusion continuity
 
-一条轮廓被前面的东西（发卡、高光条）挡住时，图上只剩遮挡物两边各一段。分别拟合的话，两段各歪各的，看起来接不上。这一步把它们认成同一条曲线的两段。只调整可见部分的几何，被挡住的部分不输出。
+When a contour is hidden by something in front of it (a hair clip or highlight strip), only a segment on each side of the occluder remains visible. Fitting them separately lets them drift in different directions, making them look disconnected. This step identifies them as two parts of the same curve. Adjust only the visible geometry; do not output the hidden portion.
 
-这里的「轮廓」既包括色块之间的分界，也包括第 3 节的笔画。发卡那里同一根发束边，上方是一条深色边线，下方只剩两个色块的分界，两种都要能接上。
+Here, “contour” includes both boundaries between color regions and the strokes from section 3. At a hair clip, the same lock-of-hair edge is a dark line above the clip but only a boundary between two regions below it; both representations must connect.
 
-**遮挡端。** 一段轮廓停在前景物体 F 开始的地方，叫遮挡端。候选来自两处：
+**Occluded ends.** An occluded end is where a contour segment stops at the start of a foreground object F. Candidates come from two sources:
 
-- 节点处的边端，前提是它没有和别的边 G1 配对（不是 T 的横杠）；
-- 边内部的拐角：轮廓碰到 F 的描边后拐了弯，沿描边走了。这类拐角往往只拐 50° 左右，所以候选拐角用 35° 的阈值，比拟合用的 60° 低。没配上对的候选不会切开曲线。
+- An edge end at a node, provided it has not been G1-paired with another edge (is not the crossbar of a T-junction);
+- A corner inside an edge: the contour meets F's outline, turns, and follows it. These turns are often only about 50°, so use a 35° threshold for candidate corners, lower than the 60° used for fitting. Unpaired candidates do not split the curve.
 
-F 的判定：从端点沿轮廓的延长方向探 6 px，第一个不属于轮廓两侧的标签。这样能越过 2–4 px 宽的描边。背景不算 F。
+Identify F by probing 6 px from the endpoint along the contour's continuation direction and taking the first label that belongs to neither side of the contour. This crosses outlines 2–4 px wide. The background does not count as F.
 
-**配对条件**，全部满足后按代价贪心配对：
+**Pairing conditions.** All must hold; then pair greedily by cost:
 
-1. 两端的 F 相同，间距 ≤ 64 px；
-2. 两端朝向对方，各自方向与连线的夹角 ≤ 30°；
-3. 连线至少 70% 落在 F 内。两端各 6 px 不计，那里常是 F 的描边，和探测 F 时的放宽一致；
-4. 两侧颜色对应：两侧 ΔE 都 < 6，或者一侧是同一个区域、另一侧 ΔE < 18；
-5. 两段可见部分（各取端点 16 px 以内）能用一条二次曲线拟合，残差 RMS ≤ 0.5 px。这一条排除了两条平行但错开的轮廓，二次曲线拟合不了 S 形。
+1. Both ends have the same F and are ≤ 64 px apart;
+2. Both ends face one another, with each direction making an angle ≤ 30° to the line joining them;
+3. At least 70% of that joining line lies within F. Exclude 6 px at each end, where F's outline often lies, matching the allowance used when probing for F;
+4. Colors on corresponding sides match: both side ΔE values are < 6, or one side is the same region and the other has ΔE < 18;
+5. The two visible portions (within 16 px of each endpoint) can be fitted by one quadratic curve with residual RMS ≤ 0.5 px. This excludes parallel but offset contours, since a quadratic curve cannot fit an S-shape.
 
-笔画的截断端用同一套配对，只是第 4 条换成笔画颜色 ΔE < 6、宽度比在 0.6–1.67 之间。
+Use the same pairing procedure for truncated stroke ends, replacing condition 4 with stroke-color ΔE < 6 and a width ratio of 0.6–1.67.
 
-**配上对之后：**
+**After pairing:**
 
-- 端点沿 F 的轮廓方向滑到联合曲线上，最多 1.5 px；
-- 端点 11 px（r0 + 8 px）以内的点向联合曲线拉近，端点处完全拉上，往里线性减弱。遮挡物边上的抗锯齿和描边会把轮廓末端掰弯，这和 5.2 跳过前 r0 的理由相同；
-- 端点切线取联合曲线的切线。节点端直接覆盖 5.3 的结果，拐角端作为强制切分点交给第 6 节。
+- Slide endpoints along F's contour onto the joint curve, by at most 1.5 px;
+- Pull points within 11 px (r0 + 8 px) of each endpoint toward the joint curve, fully at the endpoint and decreasing linearly inward. Antialiasing and outlines at the occluder's edge bend contour ends, for the same reason that 5.2 skips the first r0;
+- Use the joint curve's tangent at each endpoint. At node ends, directly override the result from 5.3; pass corner ends to section 6 as mandatory split points.
 
-样例上配出 7 对：4 对是发卡两根横条左右两端挡住的发束边，2 对是白色高光条两边的发丝，1 对在别处。下表是发卡 4 对加入这一步时测的结果。拐折角是每段末端 3 px 的方向与两段联合二次曲线切线的夹角（两段取较大者），RMS 是两段拟合结果到这条二次曲线的残差：
+The sample produces 7 pairs: 4 are lock-of-hair edges occluded at the left and right ends of the hair clip's two crossbars, 2 are hairs on either side of the white highlight strip, and 1 is elsewhere. The table below records measurements for the 4 hair-clip pairs when this step was added. The kink angle is the angle between the direction over the last 3 px of each segment and the tangent of the two segments' joint quadratic curve (taking the larger angle of the two). RMS is the residual from the two fitted segments to that quadratic curve:
 
-| 位置 | 改前 拐折角 / RMS | 改后 拐折角 / RMS |
+| Location | Before: kink angle / RMS | After: kink angle / RMS |
 | --- | --- | --- |
-| 下横条右端 | 0.3° / 0.03 px | 0.5° / 0.01 px |
-| 下横条左端 | 28.5° / 0.60 px | 4.3° / 0.18 px |
-| 上横条左端 | 12.3° / 0.29 px | 4.5° / 0.32 px |
-| 上横条右端 | 13.8° / 0.44 px | 1.3° / 0.06 px |
+| Lower crossbar, right end | 0.3° / 0.03 px | 0.5° / 0.01 px |
+| Lower crossbar, left end | 28.5° / 0.60 px | 4.3° / 0.18 px |
+| Upper crossbar, left end | 12.3° / 0.29 px | 4.5° / 0.32 px |
+| Upper crossbar, right end | 13.8° / 0.44 px | 1.3° / 0.06 px |
 
-白色高光条两边的发丝最初没有配上对：高光条下方那段是一条窄发束，被当成线画了，端点方向偏了 36°，宽度只有上方那段的 0.4 倍。第 3 节加了平台判据之后，它作为区域参与配对，联合拟合残差 0.13 px。
+The hairs on either side of the white highlight strip initially failed to pair: the lower segment was a narrow lock of hair drawn as a line, with an endpoint direction off by 36° and a width only 0.4 times that of the upper segment. After adding the plateau criterion in section 3, it participates in pairing as a region, with a joint fitting residual of 0.13 px.
 
-## 6. 曲线拟合
+## 6. Curve fitting
 
-区域边界和笔画中心线用同一套流程，只是误差阈值不同。
+Region boundaries and stroke centerlines use the same procedure, with different error thresholds.
 
-### 6.1 亚像素定位
+### 6.1 Subpixel localization
 
-分隔边上的点落在像素边界上，呈阶梯状。拟合前先把每个点沿法向挪到真实边缘：
+Points on crack edges lie on pixel boundaries and form staircases. Before fitting, move each point along its normal to the true edge:
 
-1. 沿法向在 ±3 px 内采样原图颜色 c(t)，两侧区域色为 c_L、c_R；
-2. 混合比例 α(t) = ⟨c(t) − c_R, c_L − c_R⟩ / |c_L − c_R|²；
-3. 边缘位置取 α = 0.5 处的 t。
+1. Sample original-image colors c(t) along the normal within ±3 px; let the two region colors be c_L and c_R;
+2. The mixture ratio is α(t) = ⟨c(t) − c_R, c_L − c_R⟩ / |c_L − c_R|²;
+3. Take the t where α = 0.5 as the edge position.
 
-以下情况 α 不可信，改为对点列做高斯平滑（σ = 1 px，两端固定）：两侧颜色太接近（c_L、c_R 的 ΔE < 5）；点在节点 2 px 以内；点紧挨着笔画像素（第 3 节第 10 步改过标签的地方，图上是笔画的颜色，不是两侧的混合）；算出的位移超过 1.5 px。
+In the following cases, α is unreliable; instead apply Gaussian smoothing to the point sequence (σ = 1 px, with both ends fixed): the two colors are too close (ΔE between c_L and c_R < 5); the point is within 2 px of a node; the point is immediately adjacent to stroke pixels (where labels were changed in section 3, step 10, so the image contains the stroke color rather than a mixture of the side colors); or the calculated displacement exceeds 1.5 px.
 
-### 6.2 分段
+### 6.2 Segmentation
 
-固定点 = 节点 + 拐角 + 5.5 配上对的拐角端。拐角端是强制切分点：位置保持不变，两侧切线可以单独指定。相邻两个固定点之间的点列为一段，单独拟合。
+Fixed points = nodes + corners + paired corner ends from 5.5. Corner ends are mandatory split points: their positions remain fixed, and tangents on each side can be specified independently. Fit the point sequence between each pair of consecutive fixed points as a separate segment.
 
-**拟合前平滑。** 每一段先做高斯平滑：区域边界 σ = 3 px，笔画中心线 σ = 4 px（见第 3 节）。和中心线一样，开段两端按端点做点对称延拓再滤波，端点不动；闭合且没有拐角的环用循环边界。拐角和强制切分点是段的端点，不会被磨圆。
+**Smoothing before fitting.** First apply Gaussian smoothing to each segment: σ = 3 px for region boundaries and σ = 4 px for stroke centerlines (see section 3). As with centerlines, extend open segments by point reflection about their endpoints before filtering, keeping endpoints fixed; use periodic boundaries for closed loops without corners. Corners and mandatory split points are segment endpoints, so they are not rounded off.
 
-为什么需要这一步：亚像素定位后的边界本身已经很干净，按 ±10 px 窗口的局部三次拟合算，残差 90 分位只有 0.07 px，超过 0.8 px 的 30 处全在真正的拐角上。但原图的边界带着波长 20–60 px 的缓慢起伏，幅度比 ε = 0.6 px 大，Schneider 拟合会老老实实地跟着走，看起来就是波浪。拟合误差 ε 管不了这种起伏，只能先平滑。
+Why this is needed: subpixel-localized boundaries are already very clean. A local cubic fit over a ±10 px window gives a 90th-percentile residual of only 0.07 px, and all 30 locations exceeding 0.8 px are actual corners. However, the original boundaries contain slow undulations with wavelengths of 20–60 px and amplitudes larger than ε = 0.6 px. Schneider fitting faithfully follows them, producing visible waves. The fitting tolerance ε cannot control these undulations; smoothing must come first.
 
-用「拐点数 / 100 px」衡量波浪（曲率要越过 ±1/150 px⁻¹ 才算一次变号）。区域边界上的结果：
+Measure waviness as “inflections / 100 px” (a sign change counts only when curvature crosses ±1/150 px⁻¹). Results on region boundaries:
 
-| 区域边界平滑 σ | 拐点 / 100 px | ΔE 均值 | 边缘偏差 | 贝塞尔段数 |
+| Region boundary smoothing σ | Inflections / 100 px | Mean ΔE | Edge deviation | Bézier segments |
 | --- | --- | --- | --- | --- |
 | 0 | 2.36 | 1.075 | 0.31 px | 3353 |
 | 1.5 px | 1.77 | 1.082 | 0.31 px | 2900 |
 | 2.5 px | 1.50 | 1.087 | 0.31 px | 2701 |
 | 4 px | 1.26 | 1.095 | 0.32 px | 2491 |
 
-取 3 px：再往上拐点减少得不多，色差开始明显上升。高斯平滑会让弯曲处稍微往里收，偏移约 σ²/(2R)。半径 30 px 的弯处约 0.15 px；更尖的地方都是拐角，不参与平滑。
+Choose 3 px: higher values reduce inflections little further while color error begins to rise noticeably. Gaussian smoothing pulls curved sections slightly inward, by about σ²/(2R). At a bend with radius 30 px, this is about 0.15 px; sharper locations are corners and are not smoothed.
 
-### 6.3 Schneider 拟合
+### 6.3 Schneider fitting
 
-用 Schneider 的三次贝塞尔拟合算法（*An Algorithm for Automatically Fitting Digitized Curves*，Graphics Gems，1990）：
+Use Schneider's cubic Bézier fitting algorithm (*An Algorithm for Automatically Fitting Digitized Curves*, Graphics Gems, 1990):
 
-1. 按弦长参数化；
-2. 两端切线已知，最小二乘求两个控制柄的长度，得到一条三次贝塞尔曲线。解出的长度为负、或者比点列的弧长还长时，改用弦长的 1/3：病态解会让曲线在采样点之间甩出很远。点列不超过 3 个点时直接用直线段；
-3. 算点列到曲线的最大距离 e：
-   - e ≤ ε：完成；
-   - e ≤ 16ε：用 Newton–Raphson 重新参数化，回到第 2 步，最多 8 次；
-   - 否则在误差最大的点切开，两半递归。切点处的切线取两侧点的中心差分方向，保证 G1 连续。
+1. Parameterize by chord length;
+2. With endpoint tangents known, solve for the lengths of the two control handles by least squares to obtain a cubic Bézier curve. If a solved length is negative or longer than the point sequence's arc length, use 1/3 of the chord length instead: an ill-conditioned solution can fling the curve far away between sample points. For sequences of no more than 3 points, use a straight line segment directly;
+3. Calculate the maximum distance e from the point sequence to the curve:
+   - e ≤ ε: done;
+   - e ≤ 16ε: reparameterize with Newton–Raphson and return to step 2, at most 8 times;
+   - Otherwise split at the point of greatest error and recurse on both halves. Use the central-difference direction of points on either side as the tangent at the split, ensuring G1 continuity.
 
-Schneider 原文用的是 4ε、4 次。样例上 16ε、8 次的贝塞尔段数少 5%（3685 → 3492），色差不变，拟合时间约翻倍。
+Schneider's original uses 4ε and 4 iterations. On the sample, 16ε and 8 iterations reduce Bézier segment count by 5% (3685 → 3492), leave color error unchanged, and roughly double fitting time.
 
-两端切线从哪里来：
+Sources of endpoint tangents:
 
-- T 型和 X 型中配对的边：共用切线；
-- 5.5 配上对的遮挡端：联合曲线的切线；
-- Y 型、拐角、其余端点：用 5.2 的 PCA 方向；
-- 递归产生的切点：中心差分。
+- Paired edges in T- and X-junctions: a shared tangent;
+- Paired occluded ends from 5.5: the joint curve's tangent;
+- Y-junctions, corners, and other endpoints: the PCA direction from 5.2;
+- Recursive split points: central differences.
 
-区域边界的 ε 默认 0.6 px，笔画中心线和笔画轮廓的 ε 默认 0.4 px，因为线条比色块边缘更显眼。
+Default ε is 0.6 px for region boundaries and 0.4 px for stroke centerlines and stroke contours, because lines are more visually noticeable than color-region edges.
 
-### 6.4 化简
+### 6.4 Simplification
 
-拟合完成后，从头到尾尝试合并相邻两段：两段交界处是 G1 连续时，把两段的点列合起来重拟合一条曲线，误差 ≤ ε 就合并。
+After fitting, work from start to finish and try merging adjacent segments: if the join has G1 continuity, combine their point sequences and refit a single curve. Merge if the error is ≤ ε.
 
-## 7. 上色
+## 7. Coloring
 
-**取样。** 区域掩码先腐蚀 2 px，去掉抗锯齿过渡带。腐蚀后不足 20 px 的（很窄的色块），改用骨架上的像素。笔画不在这里取色，用第 3 节第 5 步量墨量时的线色。
+**Sampling.** Erode each region mask by 2 px to remove the antialiasing transition band. If fewer than 20 px remain after erosion (very narrow regions), use skeleton pixels instead. Do not sample stroke colors here; use the line color used for ink measurement in section 3, step 5.
 
-**取色。** 取 CIELAB 中位数，再转回 sRGB 十六进制。用中位数而不用平均值：腐蚀后仍可能残留混色像素，平均值会被它们拉向邻居的颜色。
+**Color selection.** Take the CIELAB median, then convert back to sRGB hexadecimal. Use the median rather than the mean because some mixed pixels may remain after erosion and would pull the mean toward neighboring colors.
 
-**渐变（可选，默认关闭）。** 关闭时每个区域都填中位色。样例中央刘海那块渐变区填纯色时，区域内部 ΔE 的 90 分位是 7.1；填线性渐变时是 2.8。
+**Gradients (optional, disabled by default).** When disabled, fill every region with its median color. For the gradient region in the sample's central bangs, a solid fill gives a 90th-percentile interior ΔE of 7.1; a linear gradient gives 2.8.
 
-开启后，对取样像素逐通道做最小二乘拟合：c(x, y) = c0 + g_x·x + g_y·y。设区域沿梯度方向的投影长度为 D，预测跨度 Δ = |g|·D（三通道合成为 ΔE）。同时满足下面两条时，输出 `<linearGradient gradientUnits="userSpaceOnUse">`，两个 stop 放在区域沿梯度方向投影的两端：
+When enabled, fit the sampled pixels by least squares for each channel: c(x, y) = c0 + g_x·x + g_y·y. Let D be the region's projected length along the gradient direction; the predicted range is Δ = |g|·D (combining the three channels into ΔE). If both conditions below hold, output `<linearGradient gradientUnits="userSpaceOnUse">`, placing the two stops at the ends of the region's projection along the gradient direction:
 
-- Δ > 4 ΔE；
-- 拟合后残差方差比纯色模型下降 ≥ 50%。
+- Δ > 4 ΔE;
+- Residual variance after fitting is reduced by ≥ 50% compared with the solid-color model.
 
-否则仍填纯色。4 ΔE 这个阈值来自样例：大色块的颜色跨度多数 ≤ 3（噪声），少数 5–6（轻微渐变）。
+Otherwise, keep a solid fill. The 4 ΔE threshold comes from the sample: most large regions have color ranges ≤ 3 (noise), with a few at 5–6 (slight gradients).
 
-**统一颜色。** 输出前把 ΔE < 1 的颜色归成同一个值。这种差异肉眼分不出，统一后同色区域可以合并成一条 path（见 8.3），文件更小。
+**Unify colors.** Before output, map colors with ΔE < 1 to the same value. Such differences are imperceptible, and unification lets same-colored regions merge into one path (see 8.3), reducing file size.
 
-## 8. 分层与输出
+## 8. Layering and output
 
-### 8.1 图层
+### 8.1 Layers
 
-从下到上三层：
+Three layers, from bottom to top:
 
-1. 垫底描边层（见 8.2）；
-2. 填充层：所有底图区域。区域之间严格拼接、互不重叠，层内顺序不影响形状，按颜色分组输出；
-3. 笔画层。
+1. Underlay stroke layer (see 8.2);
+2. Fill layer: all base-image regions. Regions meet exactly without overlapping, so order within this layer does not affect the shapes; group output by color;
+3. Stroke layer.
 
-背景不输出。
+Do not output the background.
 
-### 8.2 接缝
+### 8.2 Seams
 
-即使两块区域共用同一条边，渲染器也会分别对它们做抗锯齿。边上的像素被两块各盖住一半，两次半透明叠加后会透出下面的东西，形成一条发丝缝 (conflation artifact)。
+Even when two regions share exactly the same edge, a renderer antialiases each independently. At a boundary pixel covered halfway by each region, the two semitransparent composites still let the underlying content show through, creating a hairline seam (a conflation artifact).
 
-处理方法是在填充层下面垫一层描边：
+Place a stroke underlay beneath the fill layer to handle this:
 
-- 两侧都是前景区域的边，每条只描一次，`stroke-width="2"`，`stroke-linecap="butt"`；
-- 描边颜色取这条边两侧区域中，在填充层里**先画**的那一个的颜色；
-- 与背景相邻的边、与图像边框重合的边不描，让前景外轮廓对透明背景正常抗锯齿；
-- 整个垫底层用前景区域的并集做 `clipPath`。否则描边在节点处会从前景外轮廓探出去，在透明背景上留下小毛刺。
+- Stroke each edge with foreground regions on both sides only once, using `stroke-width="2"` and `stroke-linecap="butt"`;
+- Use the color of whichever of the two adjacent regions is **drawn first** in the fill layer;
+- Do not stroke edges adjacent to the background or coincident with the image border, so the foreground's outer contour antialiases normally against transparency;
+- Apply a `clipPath` to the entire underlay using the union of foreground regions. Otherwise, strokes can protrude beyond the foreground's outer contour at nodes, leaving small spurs on the transparent background.
 
-宽度用 2 px 而不是 1 px，是 resvg 实测的结果：红绿两块共用一条斜向曲线边、底色为黑时，不垫底的边缘像素最多漏出约 25% 的底色；垫 1 px 描边还漏约 7%（边斜穿像素时 1 px 盖不满）；1.5 px 漏约 1.5%；2 px 不再漏。描边多出来的宽度压在后画区域的完整覆盖区里，看不见。这个宽度的单位是输出像素，不随图像尺寸缩放：缝来自渲染时的抗锯齿，和画面内容的尺度无关。
+The choice of 2 px rather than 1 px comes from measurements with resvg: for red and green regions sharing a diagonal curved edge over a black background, pixels along the edge leak up to about 25% of the background without an underlay. A 1 px underlay still leaks about 7% (it does not fully cover pixels crossed diagonally), 1.5 px leaks about 1.5%, and 2 px eliminates leakage. The extra width lies under the fully covered area of the region drawn later and is invisible. This width is measured in output pixels and does not scale with image size: the seam comes from rendering antialiasing, not the scale of the image content.
 
-为什么取先画那一侧的颜色：设边上某个像素被 A、B 各盖一半，A 先画，垫底描边以颜色 S 盖满这个像素，最终颜色是 0.5B + 0.25A + 0.25S。S = A 时正好得到 0.5A + 0.5B，和按面积混合的结果一致；S = B 时会偏向 B，相当于边界挪了约 0.25 px。
+Why use the earlier region's color? Suppose A and B each cover half of an edge pixel, A is drawn first, and an underlay stroke of color S completely covers the pixel. The final color is 0.5B + 0.25A + 0.25S. With S = A, this becomes exactly 0.5A + 0.5B, matching area-weighted mixing. With S = B, the result is biased toward B, equivalent to shifting the boundary by about 0.25 px.
 
-和「每个区域整圈加同色描边」相比，这样做边界不会偏移 0.5 px，前景外轮廓也不会被描边撑大。
+Compared with adding a same-colored stroke around every region, this method does not shift boundaries by 0.5 px or expand the foreground's outer contour.
 
-### 8.3 路径
+### 8.3 Paths
 
-- 区域轮廓 = 外轮廓 + 洞（洞的方向相反），`fill-rule="evenodd"`；
-- 同色区域合并成一条 path（填充层内顺序无关，见 8.1），同色的垫底描边也合并成一条；
-- 坐标保留 1 位小数，用相对命令；
-- 根元素 `viewBox="0 0 W H"`。
+- Region contour = outer contour + holes (with the holes oriented oppositely), using `fill-rule="evenodd"`;
+- Merge same-colored regions into one path (order is irrelevant within the fill layer; see 8.1), and merge same-colored underlay strokes into one path as well;
+- Keep 1 decimal place for coordinates and use relative commands;
+- Set the root element to `viewBox="0 0 W H"`.
 
-## 9. 回归校验
+## 9. Regression validation
 
-把输出的 SVG 用 resvg 栅格化回原尺寸，叠到背景色 c_bg 上，再和原图比较三组指标：
+Rasterize the output SVG at its original size with resvg, composite it over background color c_bg, and compare three groups of metrics with the original image:
 
-- **色差**：逐像素 ΔE 的均值、95 分位、99 分位；
-- **边缘偏差**：原图标签边界与栅格化结果边界之间的平均距离 (chamfer distance)；
-- **体积**：path 数、贝塞尔段数、文件字节数。
+- **Color error**: mean, 95th-percentile, and 99th-percentile per-pixel ΔE;
+- **Edge deviation**: mean distance between original label boundaries and rasterized-result boundaries (chamfer distance);
+- **Size**: path count, Bézier segment count, and file size in bytes.
 
-调 ε、合并阈值、拐角阈值时以这三组数为准。作为参照，分割结果本身（每个像素直接填区域中位色）的 ΔE 90 分位是 1.8，99 分位是 7.8，SVG 应该落在同一量级。区域边界附近的 ΔE 如果明显高于这个参照，先查 8.2 的接缝处理。
+Use these three groups of metrics when tuning ε, merging thresholds, or the corner threshold. As a reference, the segmentation itself (each pixel filled directly with its region's median color) has a 90th-percentile ΔE of 1.8 and a 99th-percentile ΔE of 7.8; the SVG should be of the same order. If ΔE near region boundaries is noticeably higher than this reference, first inspect the seam handling in 8.2.
 
-当前实现在样例上的结果（`grok-avatar2svg example.png --validate`）：
+Current implementation results on the sample (`grok-avatar2svg example.png --validate`):
 
-| 指标 | 默认（纯色） | `--gradients` |
+| Metric | Default (solid colors) | `--gradients` |
 | --- | --- | --- |
-| ΔE 均值 | 1.08 | 0.99 |
-| ΔE 95 分位 | 3.22 | 2.49 |
-| ΔE 99 分位 | 7.43 | 5.44 |
-| 边缘偏差 | 0.32 px | 0.30 px |
-| path 数 | 154 | 162 |
-| 贝塞尔段数 | 2787 | 2787 |
-| 文件大小 | 82 KB | 84 KB |
+| Mean ΔE | 1.08 | 0.99 |
+| 95th-percentile ΔE | 3.22 | 2.49 |
+| 99th-percentile ΔE | 7.43 | 5.44 |
+| Edge deviation | 0.32 px | 0.30 px |
+| Path count | 154 | 162 |
+| Bézier segments | 2787 | 2787 |
+| File size | 82 KB | 84 KB |
 
-整个流程约 7–9 s。
+The entire pipeline takes about 7–9 s.
 
-# 参数表
+# Parameter table
 
-像素参数以 1254 px 为基准。
+Pixel parameters use 1254 px as the reference size.
 
-| 参数 | 默认值 | 阶段 | 依据 |
+| Parameter | Default | Stage | Rationale |
 | --- | --- | --- | --- |
-| 平坦窗口 / L\* 标准差阈值 | 3×3 / 1.0 | 2 | 5×5 会丢细线 |
-| 种子连通 ΔE | 1.2 | 2 | 噪声 σ ≈ 0.5 |
-| 最小种子面积 | 12 px | 2 | |
-| 黑帽 / 白帽核 · 响应阈值 · 最小面积 | 15 px · 8 · 40 px | 2 | 线宽 2–10 px |
-| 区域合并 ΔE | 2.5 | 2 | |
-| 小区域面积 | 50 px | 2 | 也是碎块并入的上限 |
-| 边界像素改归：比自身近 · 与目标相差 | 10 ΔE · 15 ΔE | 2 | 混合像素离第三色约 22 ΔE |
-| 笔画判定 | w ≤ 12 px 且 ℓ/w ≥ 4，骨架平台比例 < 0.3 | 3 | 线 0–0.2，窄色块 ≥ 0.38 |
-| 细部：开运算半径 · 最小面积 | 2 px · 50 px | 3 | 窄于约 5 px；跳过细长区域和紧挨背景的细部 |
-| 毛刺长度 | 1.5w，笔直延续另一分支的不剪 | 3 | 被截短的线头 |
-| 中心线平滑 σ | 4 px | 3 | 拐点 5.2 → 2.4 / 100 px |
-| 笔画宽度 · 平滑 σ | 墨量（某一侧与线色 ΔE < 4 时用 2 × 距离变换）· 2w | 3 | 样例实测，见第 3 节第 5 步 |
-| 墨量：混色容差 | 侧边色与线色之差的 0.5 倍，至少 4 ΔE | 3 | 挡住线外侧更深的物体 |
-| 截断端：宽度比 · 接触像素 · 最小夹角正弦 | 0.6 · 3 px · 0.7 | 3 | 平切越过端点 (w/2)·cot θ |
-| 线头追踪：墨量下限 · 最长 | 0.3 · 64 px | 3 | 样例里最长的延长 51 px |
-| 边界线：离混色曲线 · 搜索范围 · 最短 | 5 ΔE · 两侧各 3 px · 12 px | 3 | 混色按 sRGB 算 |
-| 边界线：离第三区域 · 对比度比 · 线头延长 | 2 px · 0.2 · 4 px | 3 | 对比度比挡掉眼睛外圈的淡边 |
-| 背景 ΔE | 3 | 4 | |
-| 节点簇半径 | 2 px | 5 | |
-| 切线采样区间 | [max(3 px, w), +8 px] | 5 | 过渡带 2–4 px |
-| T / X 配对角度 | 25° | 5 | |
-| 拐角转角 · 窗口 | 60° · ±4 px | 5 | |
-| 遮挡：最大间距 · 方向夹角 · 落在 F 内的比例 | 64 px · 30° · 70% | 5.5 | |
-| 遮挡：两侧 ΔE · 联合拟合 RMS | 6 · 0.5 px | 5.5 | 样例上正确的对 ≤ 0.42 px，错误的 ≥ 0.70 px |
-| 遮挡：候选拐角 · 探测距离 · 端点滑动 · 拉近范围 | 35° · 6 px · 1.5 px · 11 px | 5.5 | |
-| 拟合误差 ε | 色块 0.6 px，笔画 0.4 px | 6 | |
-| Newton 重参数化 | e ≤ 16ε，最多 8 次 | 6 | 比 4ε 少 5% 段数 |
-| 区域边界平滑 σ | 3 px | 6 | 见 6.2 的表 |
-| 腐蚀半径 | 2 px | 7 | 过渡带 2–4 px |
-| 渐变阈值（仅开启渐变时） | Δ > 4 ΔE 且残差下降 ≥ 50% | 7 | 色块跨度 ≤ 3 / 5–6 |
-| 垫底描边宽度 | 2 px，不缩放 | 8 | resvg 实测，1 px 仍漏底色 |
+| Flatness window / L\* standard deviation threshold | 3×3 / 1.0 | 2 | 5×5 loses thin lines |
+| Seed connectivity ΔE | 1.2 | 2 | Noise σ ≈ 0.5 |
+| Minimum seed area | 12 px | 2 | |
+| Black-hat / top-hat kernel · response threshold · minimum area | 15 px · 8 · 40 px | 2 | Line widths 2–10 px |
+| Region merging ΔE | 2.5 | 2 | |
+| Small-region area | 50 px | 2 | Also the upper limit for merging fragments |
+| Boundary-pixel reassignment: closer than own color by · distance from target | 10 ΔE · 15 ΔE | 2 | Mixed pixels are about 22 ΔE from the third color |
+| Stroke classification | w ≤ 12 px and ℓ/w ≥ 4, skeleton plateau proportion < 0.3 | 3 | Lines 0–0.2, narrow color regions ≥ 0.38 |
+| Thin details: opening radius · minimum area | 2 px · 50 px | 3 | Narrower than about 5 px; skip elongated regions and details immediately adjacent to the background |
+| Spur length | 1.5w; do not prune straight continuations of another branch | 3 | Shortened line tips |
+| Centerline smoothing σ | 4 px | 3 | Inflections 5.2 → 2.4 / 100 px |
+| Stroke width · smoothing σ | Ink amount (use 2 × distance transform when ΔE between either side and line color < 4) · 2w | 3 | Measured on the sample; see section 3, step 5 |
+| Ink amount: mixture tolerance | 0.5 times the difference between side color and line color, at least 4 ΔE | 3 | Exclude darker objects outside the line |
+| Truncated ends: width ratio · contact pixels · minimum sine of intersection angle | 0.6 · 3 px · 0.7 | 3 | A flat cut extends beyond the endpoint by (w/2)·cot θ |
+| Tip tracing: minimum ink amount · maximum length | 0.3 · 64 px | 3 | Longest extension in the sample: 51 px |
+| Boundary lines: distance from mixture curve · search range · minimum length | 5 ΔE · 3 px on each side · 12 px | 3 | Mixtures calculated in sRGB |
+| Boundary lines: distance from third region · contrast ratio · tip extension | 2 px · 0.2 · 4 px | 3 | Contrast ratio excludes faint rims around the eyes |
+| Background ΔE | 3 | 4 | |
+| Node cluster radius | 2 px | 5 | |
+| Tangent sampling interval | [max(3 px, w), +8 px] | 5 | Transition band 2–4 px |
+| T / X pairing angle | 25° | 5 | |
+| Corner turning angle · window | 60° · ±4 px | 5 | |
+| Occlusion: maximum gap · direction angle · proportion inside F | 64 px · 30° · 70% | 5.5 | |
+| Occlusion: side ΔE · joint fitting RMS | 6 · 0.5 px | 5.5 | Correct pairs in the sample ≤ 0.42 px, incorrect pairs ≥ 0.70 px |
+| Occlusion: candidate corner angle · probing distance · endpoint slide · pull range | 35° · 6 px · 1.5 px · 11 px | 5.5 | |
+| Fitting error ε | Color regions 0.6 px, strokes 0.4 px | 6 | |
+| Newton reparameterization | e ≤ 16ε, at most 8 iterations | 6 | 5% fewer segments than 4ε |
+| Region boundary smoothing σ | 3 px | 6 | See the table in 6.2 |
+| Erosion radius | 2 px | 7 | Transition band 2–4 px |
+| Gradient thresholds (only when gradients are enabled) | Δ > 4 ΔE and residual reduction ≥ 50% | 7 | Region color ranges ≤ 3 / 5–6 |
+| Underlay stroke width | 2 px, unscaled | 8 | Measured with resvg; 1 px still leaks background color |
 
-# 设计决策
+# Design decisions
 
-| 决策 | 选择 | 理由 |
+| Decision | Choice | Reason |
 | --- | --- | --- |
-| 可编辑性 | 不考虑 | 只追求还原度和体积 |
-| 笔画表示 | 可变宽填充轮廓 | 能还原尖头，固定宽 `stroke` 做不到 |
-| 接缝处理 | 垫底描边（8.2） | 不需要推断遮挡关系；遮挡补全的主要收益是可编辑，已经用不上 |
-| 被遮挡的线 | 只对齐可见部分，不输出被挡住的部分 | 不考虑可编辑性；画出被挡部分还需要额外的图层顺序 |
-| 渐变 | 可选，默认关闭 | 默认全部填纯色 |
-| 背景 | 透明 | 给透明 SVG 垫纯色很容易，反过来要重新处理边缘 |
-| 拟合误差 ε | 色块边界 0.6 px，笔画 0.4 px | 亚像素级，比 2–4 px 的抗锯齿过渡带小得多 |
+| Editability | Not a consideration | Fidelity and file size are the only priorities |
+| Stroke representation | Variable-width filled contours | Reproduces pointed tips, unlike fixed-width `stroke` |
+| Seam handling | Underlay strokes (8.2) | No need to infer occlusion relationships; the main benefit of reconstructing occluded geometry is editability, which is not needed here |
+| Occluded lines | Align visible portions only; do not output hidden portions | Editability is not a consideration; drawing hidden portions would also require additional layer ordering |
+| Gradients | Optional, disabled by default | All fills are solid colors by default |
+| Background | Transparent | Adding a solid background to a transparent SVG is easy; the reverse requires reprocessing edges |
+| Fitting error ε | Region boundaries 0.6 px, strokes 0.4 px | Subpixel precision, much smaller than the 2–4 px antialiasing transition band |
 
-# 使用
+# Usage
 
 ```bash
-grok-avatar2svg example.png -o out/example.svg             # 输出 SVG
-grok-avatar2svg example.png -o out/example.svg --validate  # 同时打印第 9 节的指标，需要 resvg-py
-grok-avatar2svg example.png --gradients                    # 开启渐变
-python -m unittest discover -s tests                            # 单元测试
+grok-avatar2svg example.png -o out/example.svg             # Output SVG
+grok-avatar2svg example.png -o out/example.svg --validate  # Also print the metrics from section 9; requires resvg-py
+grok-avatar2svg example.png --gradients                    # Enable gradients
+python -m unittest discover -s tests                            # Unit tests
 ```
 
-依赖：numpy、opencv-python、pillow、scikit-image、scipy；校验需要 resvg-py。
+Dependencies: numpy, opencv-python, pillow, scikit-image, scipy; validation requires resvg-py.

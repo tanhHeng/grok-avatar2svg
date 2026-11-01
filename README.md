@@ -1,5 +1,7 @@
 # grok-avatar2svg
 
+**English** | [简体中文](README.zh-CN.md)
+
 Convert Grok bot-style raster avatars into transparent SVGs with smooth fills and variable-width outlines.
 
 The input is a raster image made of color blocks and thin lines, such as `example.png`. The output is an SVG that:
@@ -69,7 +71,7 @@ Every threshold lives in `grok_avatar2svg/params.py`. Pixel values are given for
 7. **Boundary lines.** A low-contrast outline that segmentation split between the two regions beside it shows up along their shared edge as colors that no anti-aliasing of the two sides can produce. Such stretches become strokes too.
 8. **Output.** Region fills sit on top of a clipped underlay that hides anti-aliasing seams, and strokes are drawn last.
 
-The full algorithm, with the measurements behind each parameter, is in [design.md](design.md) (written in Chinese).
+The full algorithm, with the measurements behind each parameter, is in [design.md](design.md).
 
 ## Results on `example.png`
 
