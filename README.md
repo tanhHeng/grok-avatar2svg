@@ -57,7 +57,7 @@ Every threshold lives in `avatar2svg/params.py`. Pixel values are given for a 12
 ## How it works
 
 1. **Segmentation.** Flat-color seeds plus thin-line seeds are grown with a marker-based watershed, then merged by color. Boundary pixels that clearly match a neighboring region's color are moved to it, which removes one-pixel slivers.
-2. **Lines.** Thin, elongated regions without a flat core become strokes: skeleton graph, chains that pass straight through crossings, a smoothed centerline and width profile, and tapered, round or flat-cut ends.
+2. **Lines.** Thin, elongated regions without a flat core become strokes: skeleton graph, chains that pass straight through crossings, and a smoothed centerline. Width and position are measured from the line's ink in the image, so faint stretches come out thin. Free ends follow the line in the image until it fades into a tapered tip or meets another stroke, which rejoins lines that segmentation broke apart; ends at an occluder are cut flat.
 3. **Background.** Regions connected to the image border with the border color become transparent. Enclosed regions of the same color, such as eyes, are kept.
 4. **Boundary graph.** Region boundaries form a planar map of shared edges. Junctions are classified as T, Y or X, and edges that continue through a junction share one tangent.
 5. **Occlusion continuity.** Contours cut by a front object, such as a hair clip, are paired across it and fitted as one curve.
@@ -70,11 +70,11 @@ The full algorithm, with the measurements behind each parameter, is in [design.m
 
 | Metric | Flat colors | `--gradients` |
 | --- | --- | --- |
-| Mean color error (ΔE) | 1.09 | 1.00 |
-| 99th percentile ΔE | 7.55 | 5.84 |
-| Mean edge offset | 0.32 px | 0.30 px |
-| Cubic segments | 2575 | 2575 |
-| File size | 75 KB | 78 KB |
+| Mean color error (ΔE) | 1.08 | 0.99 |
+| 99th percentile ΔE | 7.46 | 5.66 |
+| Mean edge offset | 0.31 px | 0.30 px |
+| Cubic segments | 2540 | 2540 |
+| File size | 75 KB | 77 KB |
 
 A full run takes about 8 seconds on a 1254 × 1254 image.
 
