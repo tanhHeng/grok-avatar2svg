@@ -31,6 +31,11 @@ TIP_CONTACT_MIN = 3
 # Cross-section sampling for ink coverage: step, and how far beyond the half width the side colors are read.
 INK_STEP = 0.25
 INK_SIDE_GAP = 2.5
+# Tip tracing: step along the ridge, how far the ridge may shift sideways per step, and how much of
+# each step's direction comes from the ridge (the rest is momentum, which rides over pixel noise).
+TRACE_STEP = 0.5
+TRACE_SHIFT = 1.0
+TRACE_TURN = 0.3
 
 
 @dataclass
@@ -95,7 +100,8 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
     (design 3, step 5). Returns the label map with stroke pixels given to the nearest non-stroke
     label (so the regions underneath meet along each stroke's medial axis), the strokes, and the
     stroke pixel mask. Free ends cut by an occluder (design 3, 5.5) end flat along the occluder's
-    outline, and cut ends facing each other across the same occluder share one joint curve.
+    outline, and cut ends facing each other across the same occluder share one joint curve; other
+    free ends follow the line's ridge in the image until it fades out or meets another segment.
     """
     h, w = labels.shape
     flat = flat_mask(lab, p)
@@ -142,7 +148,7 @@ def extract_strokes(lab: np.ndarray, labels: np.ndarray, p: Params) -> tuple[np.
     strokes: list[Stroke] = []
     for pi, prep in enumerate(preps):
         own = {(ci, side): c for (q, ci, side), c in cuts.items() if q == pi}
-        stroke = _finish(prep, own, p)
+        stroke = _finish(prep, own, lab, labels, p)
         if stroke is not None:
             strokes.append(stroke)
             mask_all[stroke.pixels[:, 0], stroke.pixels[:, 1]] = True
@@ -329,7 +335,7 @@ def _apply_cut(poly, widths, side, cut: _Cut, prep: _Prepared, p: Params):
     return pts, ws, cut.along, tangent
 
 
-def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], p: Params) -> Stroke | None:
+def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], lab: np.ndarray, labels: np.ndarray, p: Params) -> Stroke | None:
     eps = p.px(p.eps_stroke)
     outline: list[Curve] = []
     centerline: list[Curve] = []
@@ -338,9 +344,23 @@ def _finish(prep: _Prepared, cuts: dict[tuple[int, int], _Cut], p: Params) -> St
         kinds: list = ["round", "round"]
         tangents: list = [None, None]
         if not ch.closed:
-            natural = tuple(ch.free[s] and (ci, s) not in cuts for s in (0, 1))
-            poly, widths, tapered = _complete_tips(poly, widths, natural, prep.inside, prep.width)
-            kinds = ["taper" if tapered[s] else "round" for s in (0, 1)]
+            natural = [ch.free[s] and (ci, s) not in cuts for s in (0, 1)]
+            untraced = list(natural)
+            for s in (0, 1):
+                if not natural[s]:
+                    continue
+                pts, ws = (poly, widths) if s == 0 else (poly[::-1], widths[::-1])
+                traced = _trace_tip(lab, labels, pts, ws, prep.color, prep.width, prep.label, p)
+                if traced is None:
+                    continue
+                i0, ext, ext_w, kinds[s] = traced
+                pts, ws = np.vstack([ext[::-1], pts[i0 + 1:]]), np.concatenate([ext_w[::-1], ws[i0 + 1:]])
+                poly, widths = (pts, ws) if s == 0 else (pts[::-1], ws[::-1])
+                untraced[s] = False
+            poly, widths, tapered = _complete_tips(poly, widths, untraced, prep.inside, prep.width)
+            for s in (0, 1):
+                if untraced[s]:
+                    kinds[s] = "taper" if tapered[s] else "round"
             for s in (0, 1):
                 if (ci, s) in cuts:
                     poly, widths, kinds[s], tangents[s] = _apply_cut(poly, widths, s, cuts[(ci, s)], prep, p)
@@ -622,7 +642,8 @@ def _bridge(values: np.ndarray, bad: np.ndarray, closed: bool) -> np.ndarray:
 
 
 def _complete_tips(poly, widths, free, inside, width):
-    """Extend free ends to the region boundary; long extensions become tapered tips (width 0)."""
+    """Extend free ends to the region boundary; long extensions become tapered tips (width 0).
+    For natural ends that _trace_tip rejects."""
     tapered = [False, False]
     for side in (0, 1):
         if not free[side]:
@@ -697,6 +718,70 @@ def _ink(lab, pts, normals, guide, color, min_contrast, search=None):
     for a in (width, centre, peak):
         a[~ok] = np.nan
     return width, centre, ridge, peak
+
+
+def _trace_tip(lab, labels, pts, ws, color, width, label, p):
+    """Follow the line's ridge in the image past a natural free end (design 3, step 6).
+
+    Segmentation loses the faint part of a tapering line to the region around it, so the stroke
+    region stops short and its end looks cut off. `pts`/`ws` run from the end into the chain. Tracing
+    starts `width` back from the end, because skeleton ends hook toward a corner of the region.
+    Returns (i0, points, widths, kind): points run outward from pts[i0], where tracing started;
+    kind "taper" when the ridge fades out, "round" when it runs into another segment (the ridge
+    pixels are neither this stroke nor the regions beside it) or along a line-colored neighbor.
+    None when the ridge is still going after tip_max_trace or leaves the image: that is another
+    feature, and the end keeps the region-based tip.
+    """
+    h, w = labels.shape
+    s = arc_lengths(pts)
+    if s[-1] < 2.0:
+        return None
+    back = min(width, float(s[-1]) / 3.0)
+    i0 = int(np.searchsorted(s, back))
+    out = -direction_from_end(pts, back, 3.0 * width)
+    pos = pts[i0].copy()
+    guide = np.array([max(float(ws[i0]), 1.0)])
+    reach = 0.5 * guide[0] + INK_SIDE_GAP + 1.0
+    path, widths = [pos.copy()], [float(ws[i0])]
+    travelled, kind = 0.0, None
+    search = 0.5 * guide[0] + 1.0
+    while kind is None:
+        if travelled > p.px(p.tip_max_trace):
+            return None
+        q = pos + TRACE_STEP * out
+        if not (reach <= q[0] < w - reach and reach <= q[1] < h - reach):
+            return None
+        normal = np.array([[out[1], -out[0]]])
+        ink_w, _, shift, peak = _ink(lab, q[None, :], normal, guide, color, p.ink_min_contrast, search)
+        search = TRACE_SHIFT
+        ridge = q + shift[0] * normal[0]
+        side_labels = {labels[int(np.clip(np.floor(y), 0, h - 1)), int(np.clip(np.floor(x), 0, w - 1))]
+                       for x, y in (ridge + sgn * (0.5 * guide[0] + INK_SIDE_GAP) * normal[0] for sgn in (-1.0, 1.0))}
+        here = labels[int(np.floor(ridge[1])), int(np.floor(ridge[0]))]
+        if np.isnan(peak[0]) or (here != label and here not in side_labels):
+            kind = "round"
+        elif peak[0] < p.tip_min_ink:
+            kind = "taper"
+        else:
+            out = unit((1.0 - TRACE_TURN) * out + TRACE_TURN * unit(ridge - pos))
+            travelled += float(np.linalg.norm(ridge - pos))
+            pos = ridge
+            path.append(pos.copy())
+            widths.append(float(ink_w[0]))
+    if travelled < back + 1.0:
+        return None
+    path = np.array(path)
+    s_path = arc_lengths(path)
+    ext = resample(path, 1.0)
+    ext_w = np.interp(arc_lengths(ext), s_path, np.array(widths))
+    ext = smooth_piece(ext, p.px(p.smooth_stroke))
+    ext_w = ndimage.gaussian_filter1d(ext_w, max(1.0, p.stroke_width_sigma * width), mode="nearest")
+    ext_w = np.maximum(ext_w, MIN_WIDTH)
+    if kind == "taper":
+        s_ext = arc_lengths(ext)
+        ramp = min(width, float(s_ext[-1]) / 2.0)
+        ext_w *= np.clip((s_ext[-1] - s_ext) / max(ramp, 1e-6), 0.0, 1.0)
+    return i0, ext, ext_w, kind
 
 
 def _sample_curve(curve: Curve, closed: bool) -> np.ndarray:
